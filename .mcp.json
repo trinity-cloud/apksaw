@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "apksaw": {
+      "command": "uv",
+      "args": ["run", "--directory", "/Users/migel/cyber/apksaw", "apksaw"],
+      "env": {}
+    }
+  }
+}

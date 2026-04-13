@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.apksaw/
+*.pyc
+__pycache__/
+.claude/
+product-planning/

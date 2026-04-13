@@ -1,0 +1,36 @@
+site_name: apksaw
+site_url: https://trinity-cloud.github.io/apksaw
+repo_url: https://github.com/trinity-cloud/apksaw
+repo_name: trinity-cloud/apksaw
+
+theme:
+  name: material
+  palette:
+    scheme: slate
+    primary: deep purple
+    accent: cyan
+  features:
+    - navigation.sections
+    - navigation.expand
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Installation: installation.md
+  - Tools:
+    - Device: tools/device.md
+    - APK Analysis: tools/apk.md
+    - Decompilation: tools/dex.md
+    - Strings: tools/strings.md
+    - Cross-References: tools/xrefs.md
+    - Security: tools/security.md
+    - Certificates: tools/certificates.md
+    - Native: tools/native.md
+    - Dynamic: tools/dynamic.md
+  - Case Studies:
+    - Hinge: case-studies/hinge-audit.md
+    - Kimi AI: case-studies/kimi-audit.md
+  - Architecture: architecture.md
+  - Plugins: plugins.md
+  - Contributing: contributing.md

@@ -1,0 +1,8 @@
+[project]
+name = "apksaw-plugin-example"
+version = "0.1.0"
+description = "Example apksaw plugin"
+dependencies = ["apksaw"]
+
+[project.entry-points."apksaw.plugins"]
+example = "apksaw_plugin_example:register"
