@@ -581,7 +581,7 @@ def _build_deep_link_tests(scheme: str, host: str) -> list[dict]:
         {"name": "empty_path",        "uri": f"{scheme}://"},
         {"name": "long_query",        "uri": f"{base}/path?" + "key=value&" * 500},
         {"name": "xss_path",          "uri": f"{base}/<script>alert(1)</script>"},
-        {"name": "unicode_overflow",  "uri": f"{base}/" + "\ud800" * 50},
+        {"name": "unicode_overflow",  "uri": f"{base}/" + "%ED%A0%80" * 50},
         {"name": "double_slash",      "uri": f"{scheme}:////etc/passwd"},
         {"name": "percent_encoded_slash", "uri": f"{base}/%2e%2e/%2e%2e/etc/passwd"},
     ]
