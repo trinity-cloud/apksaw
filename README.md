@@ -59,6 +59,7 @@ apksaw MCP Server (stdio)
   +--> LIEF ------------> Native .so ELF analysis
   +--> Capstone --------> ARM/ARM64 disassembly
   +--> JADX ------------> Java decompilation (auto-downloaded)
+  +--> YARA ------------> Pattern-based malware/secret detection
   +--> ADB -------------> Device interaction, APK extraction
 ```
 
@@ -84,14 +85,15 @@ The agent calls tools, reads the structured JSON results, reasons about them, an
 | `get_components` | Activities, services, receivers, providers with export status |
 | `list_files` | All files in the APK with sizes |
 
-### DEX / Decompilation (5 tools)
+### DEX / Decompilation (6 tools)
 | Tool | Description |
 |---|---|
 | `list_classes` | Browse classes with filtering and pagination |
 | `get_class_info` | Fields, methods, superclass, interfaces |
 | `list_methods` | Search methods by class or name pattern |
-| `decompile_method` | Decompile a single method to Java (falls back to smali) |
+| `decompile_method` | Decompile a method to Java (Androguard or JADX backend) |
 | `decompile_class` | Decompile an entire class |
+| `decompile_apk_full` | Run JADX on the full APK (cached for instant subsequent lookups) |
 
 ### String Analysis (5 tools)
 | Tool | Description |
@@ -111,7 +113,7 @@ The agent calls tools, reads the structured JSON results, reasons about them, an
 | `find_method_usage` | Find all callers of a specific API |
 | `find_api_calls` | Regex search across all method invocations |
 
-### Security Scanning (6 tools)
+### Security Scanning (10 tools)
 | Tool | Description |
 |---|---|
 | `scan_manifest_security` | Debuggable, backup, exported components, cleartext |
@@ -120,6 +122,10 @@ The agent calls tools, reads the structured JSON results, reasons about them, an
 | `scan_code_injection` | WebView JS interfaces, SQL injection, Runtime.exec |
 | `scan_data_storage` | World-readable files, external storage, logcat leaks |
 | `scan_all` | Run all scanners, combined report with severity counts |
+| `scan_crypto_issues_v2` | Enhanced: argument inspection + confidence levels |
+| `scan_network_security_v2` | Enhanced: TrustManager body verification |
+| `scan_code_injection_v2` | Enhanced: reachability from exported components |
+| `scan_all_v2` | Run all v2 scanners with confidence breakdown |
 
 ### Certificate Analysis (2 tools)
 | Tool | Description |
@@ -150,6 +156,59 @@ The agent calls tools, reads the structured JSON results, reasons about them, an
 | `take_screenshot` | Screenshot to local file |
 | `prepare_frida_apk` | Frida gadget injection guide and commands |
 
+### APK Diffing (5 tools)
+| Tool | Description |
+|---|---|
+| `diff_apks` | High-level comparison of two APK versions |
+| `diff_manifest` | Permission, component, and attribute changes |
+| `diff_classes` | Added/removed/modified/renamed classes (obfuscation-resistant) |
+| `diff_strings` | New URLs, endpoints, and secrets between versions |
+| `diff_security` | Security posture changes (new vulns, fixes) |
+
+### Frida Script Generator (4 tools)
+| Tool | Description |
+|---|---|
+| `generate_frida_hook` | Generate targeted hooks (log args, return, trace) |
+| `generate_ssl_bypass` | SSL pinning bypass for the specific app's implementation |
+| `generate_token_dumper` | Hook auth interceptors to capture Bearer tokens |
+| `generate_crypto_hooks` | Hook all crypto operations (Cipher, SecretKeySpec, MessageDigest) |
+
+### API Endpoint Discovery (2 tools)
+| Tool | Description |
+|---|---|
+| `extract_api_endpoints` | Find REST URLs, Retrofit annotations, OkHttp base URLs |
+| `find_auth_interceptors` | Find OkHttp interceptors that add auth headers |
+
+### YARA Scanning (2 tools)
+| Tool | Description |
+|---|---|
+| `scan_yara` | Scan APK with 50 built-in rules (credentials, crypto, obfuscation, suspicious) |
+| `list_yara_rules` | List all available YARA rule sets |
+
+### Call Graph Visualization (1 tool)
+| Tool | Description |
+|---|---|
+| `export_call_graph` | Export call graphs as Mermaid, DOT, or JSON with security-sensitive coloring |
+
+### ProGuard / R8 Mapping (3 tools)
+| Tool | Description |
+|---|---|
+| `load_mapping` | Load a ProGuard/R8 mapping.txt for deobfuscation |
+| `deobfuscate_name` | Look up obfuscated class or method names |
+| `detect_obfuscation` | Detect obfuscator type and level (R8, ProGuard, DexGuard) |
+
+### Multi-DEX Analysis (3 tools)
+| Tool | Description |
+|---|---|
+| `list_dex_files` | List all DEX files with class/method counts |
+| `analyze_dex_boundaries` | Cross-DEX references, isolated DEX detection |
+| `get_dex_class_map` | Which classes live in which DEX file |
+
+### Plugin System (1 tool)
+| Tool | Description |
+|---|---|
+| `list_plugins` | List loaded apksaw plugins and their status |
+
 ## Examples
 
 ### Pull and scan an app in one shot
@@ -168,6 +227,18 @@ The agent calls tools, reads the structured JSON results, reasons about them, an
 > Find all calls to Runtime.exec() in this APK. For each caller,
   decompile the method and determine if the command is hardcoded
   or comes from user input.
+```
+
+### Compare two versions
+```
+> Load both v1.0 and v2.0 of the app. Diff the manifests, show me
+  any new permissions, and check if they removed certificate pinning.
+```
+
+### Generate Frida hooks
+```
+> Generate a Frida script that hooks all crypto operations in this app
+  and logs the keys, IVs, and plaintext.
 ```
 
 ### Deep dive into a specific class
@@ -204,23 +275,40 @@ Moonshot AI's chat assistant distributed globally via Google Play. apksaw's scan
 
 ```
 src/apksaw/
-  server.py            # FastMCP server (stdio transport)
-  config.py            # Paths and constants
-  session.py           # APK analysis session management
+  server.py              # FastMCP server (stdio transport)
+  config.py              # Paths and constants
+  session.py             # APK session management (in-memory + SQLite persistence)
+  db.py                  # SQLite persistence layer
+  plugins.py             # Plugin discovery and loading
   tools/
-    device.py          # ADB device interaction
-    apk.py             # APK manifest and metadata
-    dex.py             # DEX bytecode analysis and decompilation
-    strings.py         # String extraction and pattern matching
-    xrefs.py           # Cross-reference and call graph analysis
-    security.py        # Automated vulnerability scanning
-    certificates.py    # APK signing and certificate analysis
-    native.py          # ELF/SO native library analysis
-    dynamic.py         # Runtime analysis and Frida preparation
+    device.py            # ADB device interaction
+    apk.py               # APK manifest and metadata
+    dex.py               # DEX analysis and decompilation (Androguard + JADX)
+    strings.py           # String extraction and pattern matching
+    xrefs.py             # Cross-reference and call graph analysis
+    security.py          # Automated vulnerability scanning (v1)
+    security_v2.py       # Enhanced scanning with taint-lite analysis
+    certificates.py      # APK signing and certificate analysis
+    native.py            # ELF/SO native library analysis
+    dynamic.py           # Runtime analysis and Frida preparation
+    diff.py              # APK version comparison
+    frida_gen.py         # Frida script generation
+    endpoints.py         # API endpoint discovery
+    yara_scan.py         # YARA rule scanning
+    visualization.py     # Call graph export (Mermaid, DOT, JSON)
+    mapping.py           # ProGuard/R8 mapping support
+    multidex.py          # Multi-DEX analysis
   utils/
-    adb.py             # ADB command wrapper
-    bootstrap.py       # Auto-download JADX and apktool
-    jadx.py            # JADX decompiler wrapper
+    adb.py               # ADB command wrapper
+    common.py            # Shared helpers (name conversion)
+    taint_lite.py        # Lightweight taint analysis for scanner v2
+    bootstrap.py         # Auto-download JADX and apktool
+    jadx.py              # JADX decompiler wrapper
+  rules/
+    credentials.yar      # API key and secret detection (14 rules)
+    crypto.yar           # Cryptographic weakness detection (10 rules)
+    obfuscation.yar      # Packer and obfuscator detection (11 rules)
+    suspicious.yar       # Suspicious behavior detection (15 rules)
 ```
 
 ## Requirements
