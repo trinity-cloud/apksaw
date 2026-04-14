@@ -27,11 +27,14 @@ from .tools import native  # noqa: F401, E402
 from .tools import dynamic  # noqa: F401, E402
 from .tools import frida_gen  # noqa: F401, E402
 from .tools import diff  # noqa: F401, E402
+from .tools import patch_analysis  # noqa: F401, E402
 from .tools import multidex  # noqa: F401, E402
 from .tools import visualization  # noqa: F401, E402
 from .tools import mapping  # noqa: F401, E402
 from .tools import endpoints  # noqa: F401, E402
 from .tools import yara_scan  # noqa: F401, E402
+from .tools import protobuf  # noqa: F401, E402
+from .tools import fuzzer  # noqa: F401, E402
 
 # Load plugins (must be after all built-in tool imports)
 from .plugins import discover_and_load_plugins, _plugin_results  # noqa: F401, E402
