@@ -9,6 +9,12 @@ from typing import Optional
 from apksaw.server import mcp
 from apksaw.session import get_session
 
+# ---------------------------------------------------------------------------
+# Module-level JADX class cache
+# keyed by (apk_sha256, java_class_name) -> decompiled source str
+# ---------------------------------------------------------------------------
+_jadx_class_cache: dict[tuple[str, str], str] = {}
+
 
 # ---------------------------------------------------------------------------
 # Name-conversion helpers
@@ -433,163 +439,165 @@ def _decompile_single_method(
 # ---------------------------------------------------------------------------
 
 
-def _ensure_jadx_output(session) -> Path:
-    """Return the JADX output directory, running JADX if it does not exist yet.
+def _run_async(coro):
+    """Execute *coro* synchronously, working around an already-running event loop.
 
-    Raises RuntimeError if JADX decompilation fails.
+    asyncio.run() raises RuntimeError when called from inside a running loop
+    (common in MCP server environments that use asyncio internally).  We detect
+    that case and spin up a fresh thread-local loop instead.
     """
-    java_dir = session.workspace / "java"
-
-    # Check for either known output layouts
-    sources_dir = java_dir / "sources"
-    if sources_dir.exists() or java_dir.exists():
-        # Directory exists — assume already decompiled (may be partial, but honour cache)
-        if java_dir.exists() and any(java_dir.iterdir()):
-            return java_dir
-
-    # Need to run JADX
-    from apksaw.utils.jadx import decompile_apk
-
     try:
-        asyncio.run(decompile_apk(str(session.apk_path), str(java_dir)))
+        return asyncio.run(coro)
     except RuntimeError:
-        # asyncio.run() raises if there is already a running event loop (e.g. in
-        # some server environments). Fall back to creating a new loop explicitly.
         loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(decompile_apk(str(session.apk_path), str(java_dir)))
+            return loop.run_until_complete(coro)
         finally:
             loop.close()
 
-    return java_dir
-
-
-def _find_java_file(java_dir: Path, java_class_name: str) -> Optional[Path]:
-    """Locate the .java file for *java_class_name* under *java_dir*.
-
-    Handles both JADX output layouts:
-      - <java_dir>/sources/com/example/Foo.java  (most versions)
-      - <java_dir>/com/example/Foo.java          (older versions)
-
-    Also handles inner classes (e.g. ``Foo$Bar`` -> ``Foo.java``).
-    """
-    # Build relative path from Java class name (use outer class for inner classes)
-    outer_class = java_class_name.split("$")[0]
-    rel_path = Path(outer_class.replace(".", "/")).with_suffix(".java")
-
-    candidates = [
-        java_dir / "sources" / rel_path,
-        java_dir / rel_path,
-    ]
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    return None
-
-
-def _extract_method_from_source(source: str, method_name: str) -> str:
-    """Extract a method body from Java source text by searching for the method name.
-
-    Returns the extracted block if found, or the full source as a fallback.
-    """
-    lines = source.splitlines()
-    result_lines = []
-    in_method = False
-    brace_depth = 0
-
-    for i, line in enumerate(lines):
-        # Detect method signature line: contains the method name followed by '('
-        # but is not a comment or a class/interface declaration.
-        stripped = line.strip()
-        if not in_method:
-            # Match lines that look like method signatures for the target method
-            if (
-                method_name + "(" in line
-                and not stripped.startswith("//")
-                and not stripped.startswith("*")
-                and "class " not in line
-                and "interface " not in line
-            ):
-                in_method = True
-                brace_depth = 0
-                result_lines.append(line)
-                brace_depth += line.count("{") - line.count("}")
-                # Handle single-line abstract/interface method declarations
-                if brace_depth <= 0 and ";" in line:
-                    break
-                continue
-        else:
-            result_lines.append(line)
-            brace_depth += line.count("{") - line.count("}")
-            if brace_depth <= 0:
-                break
-
-    if result_lines:
-        return "\n".join(result_lines)
-
-    # Fallback: return full source
-    return source
-
 
 def _decompile_method_jadx(session, class_name: str, method_name: str, descriptor: str) -> dict:
-    """Decompile a single method using the JADX backend."""
+    """Decompile a single method using the JADX backend.
+
+    Uses single-class decompilation when JADX supports it, falling back to a
+    full-APK decompile-once strategy.  Results from decompile_class_jadx are
+    cached at module level keyed by (sha256, class_name).
+
+    Falls back to the Androguard backend if the method is not found in the
+    JADX output.
+    """
+    from apksaw.utils.jadx import decompile_method_jadx as _jadx_decompile_method
+
     java_name = _dalvik_to_java(_normalize_class_name(class_name))
+    java_dir = str(session.workspace / "java")
 
-    java_dir = _ensure_jadx_output(session)
-    java_file = _find_java_file(java_dir, java_name)
+    method_source = _run_async(
+        _jadx_decompile_method(
+            str(session.apk_path),
+            java_name,
+            method_name,
+            java_dir,
+            descriptor=descriptor,
+        )
+    )
 
-    if java_file is None:
+    if method_source is not None:
+        return {
+            "status": "ok",
+            "data": {
+                "class_name": java_name,
+                "method_name": method_name,
+                "results": [
+                    {
+                        "descriptor": descriptor,
+                        "access_flags": "",
+                        "source": method_source,
+                        "language": "java",
+                        "backend": "jadx",
+                    }
+                ],
+            },
+        }
+
+    # Method not found in JADX output — fall back to Androguard
+    return _decompile_method_androguard(session, class_name, method_name, descriptor)
+
+
+def _decompile_method_androguard(
+    session, class_name: str, method_name: str, descriptor: str
+) -> dict:
+    """Androguard decompilation path, extracted for reuse as a fallback."""
+    analysis = session.analysis
+    dex_list = session.dex_list
+    dalvik_class = _normalize_class_name(class_name)
+    java_name = _dalvik_to_java(dalvik_class)
+
+    class_analysis = None
+    for ca in analysis.find_classes(name=re.escape(dalvik_class)):
+        class_analysis = ca
+        break
+
+    if class_analysis is None:
+        return {
+            "status": "error",
+            "data": {
+                "message": f"Class '{class_name}' not found (JADX fallback also failed).",
+                "suggestion": "Use list_classes to find the correct class name.",
+            },
+        }
+
+    matched_methods = []
+    for ma in class_analysis.get_methods():
+        if ma.name != method_name:
+            continue
+        if descriptor and ma.descriptor != descriptor:
+            continue
+        matched_methods.append(ma)
+
+    if not matched_methods:
         return {
             "status": "error",
             "data": {
                 "message": (
-                    f"JADX output file not found for class '{java_name}'. "
-                    f"Searched under {java_dir}."
+                    f"Method '{method_name}' not found in '{class_name}'."
+                    + (f" (descriptor: {descriptor})" if descriptor else "")
                 ),
-                "suggestion": (
-                    "Verify the class name is correct. "
-                    "Run decompile_apk_full to ensure the APK has been fully decompiled."
-                ),
+                "suggestion": "Use list_methods to see available methods and their descriptors.",
             },
         }
 
-    source = java_file.read_text(errors="replace")
-    method_source = _extract_method_from_source(source, method_name)
+    results = []
+    for ma in matched_methods:
+        source, language = _decompile_single_method(dex_list, analysis, ma)
+        results.append(
+            {
+                "descriptor": ma.descriptor,
+                "access_flags": ma.access,
+                "source": source,
+                "language": language,
+                "backend": "androguard",
+            }
+        )
 
     return {
         "status": "ok",
         "data": {
             "class_name": java_name,
             "method_name": method_name,
-            "results": [
-                {
-                    "descriptor": descriptor,
-                    "access_flags": "",
-                    "source": method_source,
-                    "language": "java",
-                    "backend": "jadx",
-                }
-            ],
+            "results": results,
         },
     }
 
 
 def _decompile_class_jadx(session, class_name: str) -> dict:
-    """Decompile an entire class using the JADX backend."""
+    """Decompile an entire class using the JADX backend.
+
+    Results are cached in ``_jadx_class_cache`` keyed by
+    ``(session.sha256, java_class_name)`` so repeated calls for the same class
+    within a session are instant.
+    """
+    from apksaw.utils.jadx import decompile_class_jadx as _jadx_decompile_class
+
     java_name = _dalvik_to_java(_normalize_class_name(class_name))
+    cache_key = (session.sha256, java_name)
 
-    java_dir = _ensure_jadx_output(session)
-    java_file = _find_java_file(java_dir, java_name)
+    if cache_key in _jadx_class_cache:
+        source = _jadx_class_cache[cache_key]
+    else:
+        java_dir = str(session.workspace / "java")
+        source = _run_async(
+            _jadx_decompile_class(str(session.apk_path), java_name, java_dir)
+        )
+        if source is not None:
+            _jadx_class_cache[cache_key] = source
 
-    if java_file is None:
+    if source is None:
         return {
             "status": "error",
             "data": {
                 "message": (
                     f"JADX output file not found for class '{java_name}'. "
-                    f"Searched under {java_dir}."
+                    f"Searched under {session.workspace / 'java'}."
                 ),
                 "suggestion": (
                     "Verify the class name is correct. "
@@ -597,8 +605,6 @@ def _decompile_class_jadx(session, class_name: str) -> dict:
                 ),
             },
         }
-
-    source = java_file.read_text(errors="replace")
 
     return {
         "status": "ok",
@@ -607,7 +613,7 @@ def _decompile_class_jadx(session, class_name: str) -> dict:
             "source": source,
             "language": "java",
             "backend": "jadx",
-            "method_count": source.count("{") - source.count("}") + 1,  # rough estimate
+            "method_count": len(list(re.finditer(r'\bvoid\b|\bint\b|\bboolean\b|\bString\b|\bobject\b', source))),
         },
     }
 
@@ -647,70 +653,13 @@ def decompile_method(
         session = get_session(session_id)
 
         if backend == "jadx":
+            # JADX path: uses single-class decompilation where supported,
+            # falls back to Androguard automatically if the method is not
+            # found in the JADX output.
             return _decompile_method_jadx(session, class_name, method_name, descriptor)
 
         # --- Androguard backend (default) ---
-        analysis = session.analysis
-        dex_list = session.dex_list
-
-        dalvik_class = _normalize_class_name(class_name)
-
-        class_analysis = None
-        for ca in analysis.find_classes(name=re.escape(dalvik_class)):
-            class_analysis = ca
-            break
-
-        if class_analysis is None:
-            return {
-                "status": "error",
-                "data": {
-                    "message": f"Class '{class_name}' not found.",
-                    "suggestion": "Use list_classes to find the correct class name.",
-                },
-            }
-
-        matched_methods = []
-        for ma in class_analysis.get_methods():
-            if ma.name != method_name:
-                continue
-            if descriptor and ma.descriptor != descriptor:
-                continue
-            matched_methods.append(ma)
-
-        if not matched_methods:
-            return {
-                "status": "error",
-                "data": {
-                    "message": (
-                        f"Method '{method_name}' not found in '{class_name}'."
-                        + (f" (descriptor: {descriptor})" if descriptor else "")
-                    ),
-                    "suggestion": (
-                        "Use list_methods to see available methods and their descriptors."
-                    ),
-                },
-            }
-
-        results = []
-        for ma in matched_methods:
-            source, language = _decompile_single_method(dex_list, analysis, ma)
-            results.append(
-                {
-                    "descriptor": ma.descriptor,
-                    "access_flags": ma.access,
-                    "source": source,
-                    "language": language,
-                }
-            )
-
-        return {
-            "status": "ok",
-            "data": {
-                "class_name": _dalvik_to_java(dalvik_class),
-                "method_name": method_name,
-                "results": results,
-            },
-        }
+        return _decompile_method_androguard(session, class_name, method_name, descriptor)
 
     except KeyError as exc:
         return {
@@ -923,17 +872,7 @@ def decompile_apk_full(session_id: str) -> dict:
 
         from apksaw.utils.jadx import decompile_apk
 
-        try:
-            asyncio.run(decompile_apk(str(session.apk_path), output_dir_str))
-        except RuntimeError:
-            # Fallback for environments with an existing event loop
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(
-                    decompile_apk(str(session.apk_path), output_dir_str)
-                )
-            finally:
-                loop.close()
+        _run_async(decompile_apk(str(session.apk_path), output_dir_str))
 
         # Count produced .java files
         java_dir_path = Path(output_dir_str)

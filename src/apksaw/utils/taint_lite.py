@@ -65,6 +65,13 @@ _ALL_ENTRY_POINT_NAMES = (
 # Maximum call-graph depth for reachability BFS
 _BFS_MAX_DEPTH = 10
 
+# Exception type descriptors considered "catch-all" for swallow detection
+_CATCH_ALL_TYPES = frozenset({
+    "Ljava/lang/Throwable;",
+    "Ljava/lang/Exception;",
+    "Ljava/lang/RuntimeException;",
+})
+
 
 # ----------------------------------------------------------------------- #
 # Public API
@@ -76,6 +83,8 @@ def get_const_string_at_callsite(
     method_analysis,
     invoke_offset: int,
     arg_index: int,
+    follow_calls: bool = False,
+    max_depth: int = 2,
 ) -> str | None:
     """Walk backwards from an invoke instruction to find the const-string
     that feeds the argument at *arg_index*.
@@ -85,6 +94,12 @@ def get_const_string_at_callsite(
     by the invoke for the given argument and looks for a ``const-string``
     (or ``const-string/jumbo``) assignment to that register, following
     ``move-object`` and ``move-result-object`` chains one level deep.
+
+    When *follow_calls* is ``True`` and the intra-procedural trace cannot
+    resolve to a constant (e.g. the value comes from a ``move-result-object``),
+    the function attempts inter-procedural resolution by calling
+    :func:`resolve_constant_interprocedural` and returning the resolved value
+    if all return paths of the callee yield the same constant.
 
     Args:
         analysis: Androguard ``Analysis`` object.
@@ -96,6 +111,11 @@ def get_const_string_at_callsite(
         arg_index: Zero-based index of the argument whose source we want.
             For instance methods the first argument (index 0) is ``this``;
             static-method argument 0 is the first explicit parameter.
+        follow_calls: When ``True``, follow ``method_return`` traces across
+            method boundaries using inter-procedural analysis.  Defaults to
+            ``False`` for backward compatibility.
+        max_depth: Maximum number of inter-procedural hops to follow when
+            *follow_calls* is ``True``.  Defaults to ``2``.
 
     Returns:
         The constant string value if one can be resolved, otherwise ``None``.
@@ -137,11 +157,403 @@ def get_const_string_at_callsite(
             return None
 
         # Walk backwards from invoke_idx to find what loaded target_reg
-        return _trace_register_backward(instructions, invoke_idx - 1, target_reg)
+        result = _trace_register_backward(instructions, invoke_idx - 1, target_reg)
+        if result is not None:
+            return result
+
+        # Intra-procedural trace failed — try inter-procedural if requested
+        if follow_calls and max_depth > 0:
+            value, _src_type, _trace = resolve_constant_interprocedural(
+                analysis, method_analysis, invoke_offset, arg_index,
+                max_depth=max_depth,
+            )
+            return value
+
+        return None
 
     except Exception as exc:
         logger.debug("get_const_string_at_callsite failed: %s", exc)
         return None
+
+
+def resolve_constant_interprocedural(
+    analysis,
+    method_analysis,
+    invoke_offset: int,
+    arg_index: int,
+    max_depth: int = 2,
+) -> tuple[str | None, str, list[str]]:
+    """Resolve a method argument to its constant value, following up to
+    *max_depth* levels of method calls.
+
+    This function first performs an intra-procedural trace identical to
+    :func:`get_const_string_at_callsite`.  When the trace hits a
+    ``move-result-object`` (the value comes from a nested call), it attempts
+    to follow into that callee and check whether *all* of its return paths
+    yield the same constant string.
+
+    The function also handles the case where the argument originates from a
+    field load (``iget-object`` / ``sget-object``): it inspects write
+    cross-references for that field and returns the constant if the field is
+    written exactly once with a literal string.
+
+    Args:
+        analysis: Androguard ``Analysis`` object.
+        method_analysis: ``MethodAnalysis`` for the *caller* method.
+        invoke_offset: Byte offset of the outer invoke instruction (the one
+            whose argument we are resolving).
+        arg_index: Zero-based argument index.
+        max_depth: Maximum number of inter-procedural hops.  Pass ``0`` to
+            disable recursive following.
+
+    Returns:
+        A three-tuple ``(value, source_type, trace)`` where:
+
+        - *value* is the constant string if resolved, ``None`` otherwise.
+        - *source_type* is one of:
+          ``'constant'``, ``'parameter'``, ``'field'``,
+          ``'method_return_constant'``, ``'method_return_unknown'``,
+          ``'unknown'``.
+        - *trace* is a list of ``"Lclass;->method"`` strings showing the
+          resolution path from outermost caller inward.
+    """
+    trace: list[str] = [f"{method_analysis.class_name}->{method_analysis.name}"]
+
+    try:
+        method = method_analysis.get_method()
+        if method is None:
+            return None, "unknown", trace
+
+        instructions = list(method.get_instructions())
+        if not instructions:
+            return None, "unknown", trace
+
+        # ------------------------------------------------------------------
+        # Step 1: locate the invoke instruction and identify the argument reg
+        # ------------------------------------------------------------------
+        current_offset = 0
+        invoke_idx: int | None = None
+        offset_map: dict[int, int] = {}  # byte_offset -> list index
+
+        for idx, instr in enumerate(instructions):
+            offset_map[current_offset] = idx
+            if current_offset == invoke_offset:
+                invoke_idx = idx
+            current_offset += instr.get_length()
+
+        if invoke_idx is None:
+            # Loose match within ±8 bytes
+            for offset, idx in offset_map.items():
+                if abs(offset - invoke_offset) <= 8 and "invoke" in instructions[idx].get_name():
+                    invoke_idx = idx
+                    break
+
+        if invoke_idx is None:
+            return None, "unknown", trace
+
+        invoke_instr = instructions[invoke_idx]
+        target_reg = _get_invoke_arg_register(invoke_instr, arg_index)
+        if target_reg is None:
+            return None, "unknown", trace
+
+        # ------------------------------------------------------------------
+        # Step 2: intra-procedural backward trace
+        # ------------------------------------------------------------------
+        const_val = _trace_register_backward(instructions, invoke_idx - 1, target_reg)
+        if const_val is not None:
+            return const_val, "constant", trace
+
+        src_type = _classify_register_source(instructions, invoke_idx - 1, target_reg)
+
+        # ------------------------------------------------------------------
+        # Step 3: handle method_return — recurse into the callee
+        # ------------------------------------------------------------------
+        if src_type == "method_return" and max_depth > 0:
+            # Find the invoke instruction that produced move-result-object
+            inner_invoke_instr, inner_invoke_offset = _find_preceding_invoke(
+                instructions, invoke_idx - 1, target_reg
+            )
+            if inner_invoke_instr is not None:
+                callee_class, callee_method = _parse_invoke_target(inner_invoke_instr)
+                if callee_class and callee_method:
+                    trace.append(f"{callee_class}->{callee_method}")
+                    callee_val, callee_type = _check_callee_returns_constant(
+                        analysis, callee_class, callee_method,
+                        max_depth=max_depth - 1,
+                        visited=set(trace),
+                    )
+                    if callee_val is not None:
+                        return callee_val, "method_return_constant", trace
+                    return None, "method_return_unknown", trace
+
+        # ------------------------------------------------------------------
+        # Step 4: handle field sources — check field write cross-references
+        # ------------------------------------------------------------------
+        if src_type == "field":
+            field_name, field_class = _find_field_from_register(
+                instructions, invoke_idx - 1, target_reg
+            )
+            if field_name and field_class:
+                field_val = _resolve_field_constant(analysis, field_class, field_name)
+                if field_val is not None:
+                    trace.append(f"{field_class}.{field_name} (field)")
+                    return field_val, "field", trace
+
+        return None, src_type if src_type else "unknown", trace
+
+    except Exception as exc:
+        logger.debug("resolve_constant_interprocedural failed: %s", exc)
+        return None, "unknown", trace
+
+
+def analyze_exception_handler(
+    analysis,
+    class_name: str,
+    method_name: str,
+) -> dict:
+    """Analyze what a method's exception handlers do.
+
+    Inspects the try-catch table embedded in the method's Dalvik bytecode and
+    classifies each handler.  This is primarily used to detect ``TrustManager``
+    implementations that silently swallow certificate validation exceptions
+    (e.g. ``catch (Throwable) { /* empty */ return; }``).
+
+    Args:
+        analysis: Androguard ``Analysis`` object.
+        class_name: Class name in Dalvik (``Lcom/Foo;``) or Java (``com.Foo``)
+            format.
+        method_name: Simple method name (e.g. ``checkServerTrusted``).
+
+    Returns:
+        A dict with the following keys:
+
+        - ``has_catch_all`` (bool): ``True`` if any handler catches
+          ``Throwable``, ``Exception``, or ``RuntimeException``.
+        - ``swallows_exception`` (bool): ``True`` if at least one handler
+          body is empty (only ``move-exception`` + ``return-void``, or
+          ``move-exception`` + a single log/no-op + ``return-void``).
+        - ``rethrows`` (bool): ``True`` if at least one handler contains a
+          ``throw`` instruction.
+        - ``handler_actions`` (list[str]): Human-readable description of
+          what each handler does.
+
+        On any error, returns a safe default with all booleans ``False`` and
+        an empty ``handler_actions`` list.
+    """
+    result: dict = {
+        "has_catch_all": False,
+        "swallows_exception": False,
+        "rethrows": False,
+        "handler_actions": [],
+    }
+
+    try:
+        dalvik_name = _to_dalvik(class_name)
+        class_analysis = analysis.get_class_analysis(dalvik_name)
+        if class_analysis is None:
+            return result
+
+        target_method = None
+        for ma in class_analysis.get_methods():
+            if ma.name == method_name:
+                target_method = ma.get_method()
+                break
+
+        if target_method is None:
+            return result
+
+        code = target_method.get_code()
+        if code is None:
+            return result
+
+        # Collect all instructions with their byte offsets for handler analysis
+        instructions = list(target_method.get_instructions())
+        offset_to_idx: dict[int, int] = {}
+        current_offset = 0
+        for idx, instr in enumerate(instructions):
+            offset_to_idx[current_offset] = idx
+            current_offset += instr.get_length()
+
+        # Try to read try-catch table
+        try:
+            tries = code.get_tries()
+        except Exception:
+            tries = []
+
+        if not tries:
+            return result
+
+        for try_block in tries:
+            try:
+                handlers = try_block.get_handlers()
+                if handlers is None:
+                    continue
+
+                # Handlers is a TryItem-level object; iterate its pairs
+                handler_list = handlers.get_handlers()
+                if not handler_list:
+                    continue
+
+                for handler_pair in handler_list:
+                    try:
+                        # handler_pair: (exception_type_or_None, handler_offset)
+                        exc_type = handler_pair.get_exception_type()
+                        handler_offset = handler_pair.get_handler_offset()
+                    except AttributeError:
+                        # Older Androguard: handler_pair is (exc_type, offset)
+                        try:
+                            exc_type, handler_offset = handler_pair
+                        except (TypeError, ValueError):
+                            continue
+
+                    # Classify the exception type
+                    is_catch_all = (
+                        exc_type is None  # catch-all (no type = covers all)
+                        or exc_type in _CATCH_ALL_TYPES
+                    )
+                    if is_catch_all:
+                        result["has_catch_all"] = True
+
+                    # Inspect the handler body starting at handler_offset
+                    action = _classify_handler_body(
+                        instructions, offset_to_idx, handler_offset
+                    )
+                    exc_label = exc_type if exc_type else "catch-all"
+                    result["handler_actions"].append(f"catch({exc_label}): {action}")
+
+                    if action == "swallows":
+                        result["swallows_exception"] = True
+                    elif action == "rethrows":
+                        result["rethrows"] = True
+
+            except Exception as exc:
+                logger.debug("analyze_exception_handler handler parse failed: %s", exc)
+                continue
+
+    except Exception as exc:
+        logger.debug("analyze_exception_handler failed: %s", exc)
+
+    return result
+
+
+def get_method_complexity(
+    analysis,
+    class_name: str,
+    method_name: str,
+) -> dict:
+    """Score a method's complexity to help determine if it is trivial or
+    substantial.
+
+    The complexity score is a heuristic on a 0–100 scale:
+
+    - Each instruction contributes 1 point (capped at 50).
+    - Each branch instruction (``if-*``, ``packed-switch``, ``sparse-switch``)
+      contributes an additional 3 points (capped at 30).
+    - Each ``invoke-*`` contributes an additional 2 points (capped at 20).
+
+    A method is considered *trivial* if it has ≤ 5 instructions and no branch
+    or invoke instructions.
+
+    Args:
+        analysis: Androguard ``Analysis`` object.
+        class_name: Class name in Dalvik or Java format.
+        method_name: Simple method name.
+
+    Returns:
+        A dict with the following keys:
+
+        - ``instruction_count`` (int): Total number of bytecode instructions.
+        - ``branch_count`` (int): Number of branching instructions.
+        - ``invoke_count`` (int): Number of method-call instructions.
+        - ``return_count`` (int): Number of return instructions.
+        - ``throws`` (bool): ``True`` if the method contains a ``throw``
+          instruction.
+        - ``has_try_catch`` (bool): ``True`` if the method has a try-catch
+          table.
+        - ``is_trivial`` (bool): ``True`` if the method has ≤ 5 instructions
+          and no branches or invokes.
+        - ``complexity_score`` (int): Heuristic score in [0, 100].
+
+        On any error, returns safe defaults with all counts 0 and booleans
+        ``False``.
+    """
+    defaults: dict = {
+        "instruction_count": 0,
+        "branch_count": 0,
+        "invoke_count": 0,
+        "return_count": 0,
+        "throws": False,
+        "has_try_catch": False,
+        "is_trivial": False,
+        "complexity_score": 0,
+    }
+
+    try:
+        dalvik_name = _to_dalvik(class_name)
+        class_analysis = analysis.get_class_analysis(dalvik_name)
+        if class_analysis is None:
+            return defaults
+
+        target_method = None
+        for ma in class_analysis.get_methods():
+            if ma.name == method_name:
+                target_method = ma.get_method()
+                break
+
+        if target_method is None:
+            return defaults
+
+        code = target_method.get_code()
+        instructions = list(target_method.get_instructions()) if code else []
+
+        instr_count = len(instructions)
+        branch_count = 0
+        invoke_count = 0
+        return_count = 0
+        throws = False
+
+        for instr in instructions:
+            name = instr.get_name()
+            if name.startswith("if-") or name in ("packed-switch", "sparse-switch"):
+                branch_count += 1
+            elif name.startswith("invoke"):
+                invoke_count += 1
+            elif name.startswith("return"):
+                return_count += 1
+            elif name == "throw":
+                throws = True
+
+        # Check for try-catch table
+        has_try_catch = False
+        if code is not None:
+            try:
+                tries = code.get_tries()
+                has_try_catch = bool(tries)
+            except Exception:
+                pass
+
+        is_trivial = (instr_count <= 5) and (branch_count == 0) and (invoke_count == 0)
+
+        # Compute composite score (capped components to avoid runaway scores)
+        score_instrs = min(instr_count, 50)
+        score_branches = min(branch_count * 3, 30)
+        score_invokes = min(invoke_count * 2, 20)
+        complexity_score = min(score_instrs + score_branches + score_invokes, 100)
+
+        return {
+            "instruction_count": instr_count,
+            "branch_count": branch_count,
+            "invoke_count": invoke_count,
+            "return_count": return_count,
+            "throws": throws,
+            "has_try_catch": has_try_catch,
+            "is_trivial": is_trivial,
+            "complexity_score": complexity_score,
+        }
+
+    except Exception as exc:
+        logger.debug("get_method_complexity failed: %s", exc)
+        return defaults
 
 
 def is_reachable_from_exported(analysis, apk, target_method_analysis) -> bool:
@@ -255,10 +667,20 @@ def check_empty_method_body(
 ) -> bool:
     """Check if a method has an empty or trivially-returning body.
 
-    A method is considered "empty" if its instruction sequence contains
-    only a single ``return-void`` (or ``return`` with a constant 0/null),
-    or if it contains no instructions at all.  This is used to detect
-    TrustManager implementations whose ``checkServerTrusted`` does nothing.
+    A method is considered "empty" if:
+
+    1. It has no bytecode at all.
+    2. Its instruction sequence is a single ``return-void`` / ``return``
+       / ``return-object``.
+    3. It is two instructions: a zero/null constant load followed by
+       ``return`` / ``return-void`` / ``return-object``.
+    4. Its entire meaningful logic is wrapped in a try-catch block where
+       the catch handler is a *catch-all* (``Throwable`` / ``Exception``)
+       that swallows the exception (i.e. only ``move-exception`` +
+       ``return-void`` with no re-throw).  This pattern is common in
+       broken TrustManager implementations that delegate to a real
+       validator but swallow any ``CertificateException`` it raises,
+       effectively disabling validation.
 
     Args:
         analysis: Androguard ``Analysis`` object.
@@ -306,6 +728,12 @@ def check_empty_method_body(
                     "return-object",
                 ):
                     return True
+
+            # Check for the swallowing catch-all pattern:
+            # try { someValidation() } catch (Throwable) { return; }
+            handler_info = analyze_exception_handler(analysis, class_name, method_name)
+            if handler_info["has_catch_all"] and handler_info["swallows_exception"]:
+                return True
 
             return False  # Non-trivial body
 
@@ -389,7 +817,438 @@ def get_arg_source_type(
 
 
 # ----------------------------------------------------------------------- #
-# Private helpers
+# Private helpers — inter-procedural resolution
+# ----------------------------------------------------------------------- #
+
+
+def _check_callee_returns_constant(
+    analysis,
+    callee_class: str,
+    callee_method: str,
+    max_depth: int,
+    visited: set[str],
+) -> tuple[str | None, str]:
+    """Check if ALL return paths of a callee return the same constant string.
+
+    Walks every ``return-object`` instruction in the callee's body and traces
+    the returned register backwards.  If every path resolves to the same
+    literal, that literal is returned.  If any path is non-constant or
+    resolves to a different value, returns ``(None, 'unknown')``.
+
+    To prevent infinite recursion, the *visited* set tracks already-seen
+    ``"Lclass;->method"`` strings.
+
+    Args:
+        analysis: Androguard ``Analysis`` object.
+        callee_class: Dalvik-format class descriptor of the callee.
+        callee_method: Simple method name of the callee.
+        max_depth: Remaining recursion budget.
+        visited: Set of already-visited ``"class->method"`` identifiers.
+
+    Returns:
+        ``(constant_value, source_type)`` or ``(None, 'unknown')``.
+    """
+    key = f"{callee_class}->{callee_method}"
+    if key in visited or max_depth < 0:
+        return None, "unknown"
+
+    visited = visited | {key}
+
+    try:
+        class_analysis = analysis.get_class_analysis(callee_class)
+        if class_analysis is None:
+            return None, "unknown"
+
+        target_method = None
+        for ma in class_analysis.get_methods():
+            if ma.name == callee_method:
+                target_method = ma.get_method()
+                break
+
+        if target_method is None:
+            return None, "unknown"
+
+        instructions = list(target_method.get_instructions())
+        if not instructions:
+            return None, "unknown"
+
+        # Collect all return-object instruction indices
+        return_indices: list[int] = []
+        for idx, instr in enumerate(instructions):
+            if instr.get_name() in ("return-object", "return"):
+                return_indices.append(idx)
+
+        if not return_indices:
+            return None, "unknown"
+
+        resolved_values: list[str] = []
+
+        for ret_idx in return_indices:
+            ret_instr = instructions[ret_idx]
+            # The returned register is the first (and only) operand
+            output = ret_instr.get_output().strip()
+            ret_reg = _get_dest_register(output)
+            if ret_reg is None:
+                # return-void or malformed — skip
+                continue
+
+            # Trace the returned register backwards
+            const_val = _trace_register_backward(instructions, ret_idx - 1, ret_reg)
+            if const_val is not None:
+                resolved_values.append(const_val)
+                continue
+
+            # Check if it comes from a nested call (and we have budget)
+            src_type = _classify_register_source(instructions, ret_idx - 1, ret_reg)
+            if src_type == "method_return" and max_depth > 0:
+                inner_invoke, _ = _find_preceding_invoke(
+                    instructions, ret_idx - 1, ret_reg
+                )
+                if inner_invoke is not None:
+                    inner_class, inner_method = _parse_invoke_target(inner_invoke)
+                    if inner_class and inner_method:
+                        nested_val, nested_type = _check_callee_returns_constant(
+                            analysis, inner_class, inner_method,
+                            max_depth=max_depth - 1,
+                            visited=visited,
+                        )
+                        if nested_val is not None:
+                            resolved_values.append(nested_val)
+                            continue
+            # Non-constant path found — give up
+            return None, "unknown"
+
+        if not resolved_values:
+            return None, "unknown"
+
+        # All paths must agree on the same constant
+        unique_vals = set(resolved_values)
+        if len(unique_vals) == 1:
+            return resolved_values[0], "method_return_constant"
+
+        return None, "unknown"
+
+    except Exception as exc:
+        logger.debug("_check_callee_returns_constant failed: %s", exc)
+        return None, "unknown"
+
+
+def _find_preceding_invoke(
+    instructions: list,
+    start_idx: int,
+    result_reg: str,
+) -> tuple[object | None, int]:
+    """Walk backwards from *start_idx* to find the invoke instruction whose
+    result was stored in *result_reg* via ``move-result-object``.
+
+    Returns ``(invoke_instruction, byte_offset)`` or ``(None, -1)``.
+    """
+    # First find the move-result-object that wrote to result_reg
+    current_reg = result_reg
+    for idx in range(start_idx, -1, -1):
+        instr = instructions[idx]
+        mnemonic = instr.get_name()
+        output = instr.get_output()
+
+        # Follow move chains
+        if mnemonic in ("move-object", "move", "move-wide",
+                        "move-object/from16", "move/from16"):
+            dest = _get_dest_register(output)
+            if dest == current_reg:
+                src = _get_move_source(output)
+                if src:
+                    current_reg = src
+            continue
+
+        dest = _get_dest_register(output)
+        if dest != current_reg:
+            continue
+
+        if mnemonic in ("move-result-object", "move-result", "move-result-wide"):
+            # The very next previous instruction must be the invoke
+            for inner_idx in range(idx - 1, -1, -1):
+                inner_instr = instructions[inner_idx]
+                if "invoke" in inner_instr.get_name():
+                    # Compute byte offset of that invoke
+                    byte_offset = 0
+                    for i, ins in enumerate(instructions):
+                        if i == inner_idx:
+                            return inner_instr, byte_offset
+                        byte_offset += ins.get_length()
+                break  # Only look one step back
+
+        break
+
+    return None, -1
+
+
+def _parse_invoke_target(invoke_instr) -> tuple[str | None, str | None]:
+    """Extract the target class and method name from an invoke instruction.
+
+    Androguard formats invoke instructions as::
+
+        invoke-virtual {v0, v1}, Ljava/lang/String;->valueOf(I)Ljava/lang/String;
+
+    The part after the ``},`` space contains the full method reference in
+    ``Lclass;->method(sig)rettype`` format.
+
+    Returns:
+        ``(class_descriptor, method_name)`` or ``(None, None)`` on failure.
+    """
+    try:
+        output = invoke_instr.get_output()
+        # Find the method reference after the closing brace
+        brace_end = output.find("}")
+        if brace_end == -1:
+            return None, None
+        ref_part = output[brace_end + 1:].strip().lstrip(",").strip()
+
+        # ref_part looks like: Lsome/Class;->methodName(...)RetType
+        arrow_idx = ref_part.find("->")
+        if arrow_idx == -1:
+            return None, None
+
+        class_desc = ref_part[:arrow_idx].strip()  # e.g. "Ljava/lang/String;"
+        rest = ref_part[arrow_idx + 2:]             # e.g. "methodName(...)RetType"
+
+        paren_idx = rest.find("(")
+        method_name = rest[:paren_idx].strip() if paren_idx != -1 else rest.strip()
+
+        if not class_desc or not method_name:
+            return None, None
+
+        return class_desc, method_name
+
+    except Exception:
+        return None, None
+
+
+def _find_field_from_register(
+    instructions: list,
+    start_idx: int,
+    target_reg: str,
+) -> tuple[str | None, str | None]:
+    """Walk backwards from *start_idx* to find an ``iget-object`` /
+    ``sget-object`` instruction that loaded *target_reg*.
+
+    Returns:
+        ``(field_name, declaring_class)`` extracted from the instruction
+        output, or ``(None, None)`` if not found.
+
+    The Androguard output for ``iget-object`` looks like::
+
+        v2, v0, Lcom/example/Foo;->mKey [Ljava/lang/String;
+    """
+    current_reg = target_reg
+    for idx in range(start_idx, -1, -1):
+        instr = instructions[idx]
+        mnemonic = instr.get_name()
+        output = instr.get_output()
+
+        if mnemonic in ("move-object", "move", "move-wide",
+                        "move-object/from16", "move/from16"):
+            dest = _get_dest_register(output)
+            if dest == current_reg:
+                src = _get_move_source(output)
+                if src:
+                    current_reg = src
+            continue
+
+        dest = _get_dest_register(output)
+        if dest != current_reg:
+            continue
+
+        if mnemonic in ("iget-object", "iget", "iget-boolean", "iget-byte",
+                        "iget-char", "iget-short", "iget-wide",
+                        "sget-object", "sget", "sget-boolean", "sget-byte",
+                        "sget-char", "sget-short", "sget-wide"):
+            # Parse field reference from output
+            # sget: "v2, Lcom/example/Foo;->FIELD_NAME [type"
+            # iget: "v2, v1, Lcom/example/Foo;->FIELD_NAME [type"
+            try:
+                parts = output.split(",")
+                # Field ref is the last comma-separated component before "["
+                field_ref_part = parts[-1].strip()
+                arrow_idx = field_ref_part.find("->")
+                if arrow_idx != -1:
+                    class_desc = field_ref_part[:arrow_idx].strip()
+                    rest = field_ref_part[arrow_idx + 2:]
+                    # rest: "FIELD_NAME [Ljava/lang/String;"
+                    space_idx = rest.find(" ")
+                    field_name = rest[:space_idx].strip() if space_idx != -1 else rest.strip()
+                    return field_name, class_desc
+            except Exception:
+                pass
+
+        break
+
+    return None, None
+
+
+def _resolve_field_constant(
+    analysis,
+    field_class: str,
+    field_name: str,
+) -> str | None:
+    """Attempt to resolve a field's value to a constant string by inspecting
+    write cross-references.
+
+    If the field is written exactly once with a ``const-string`` instruction,
+    return that string.  Otherwise return ``None``.
+
+    Args:
+        analysis: Androguard ``Analysis`` object.
+        field_class: Dalvik descriptor of the declaring class.
+        field_name: Name of the field.
+
+    Returns:
+        The constant string if the field has exactly one constant write,
+        ``None`` otherwise.
+    """
+    try:
+        class_analysis = analysis.get_class_analysis(field_class)
+        if class_analysis is None:
+            return None
+
+        field_analysis = None
+        for fa in class_analysis.get_fields():
+            if fa.name == field_name:
+                field_analysis = fa
+                break
+
+        if field_analysis is None:
+            return None
+
+        write_xrefs = list(field_analysis.get_xref_write())
+        if not write_xrefs:
+            return None
+
+        # Each xref_write entry: (ClassAnalysis, MethodAnalysis, offset)
+        constant_values: list[str] = []
+
+        for _, writer_ma, write_offset in write_xrefs:
+            writer_method = writer_ma.get_method()
+            if writer_method is None:
+                return None
+
+            writer_instructions = list(writer_method.get_instructions())
+
+            # Find the write instruction at write_offset
+            current_offset = 0
+            write_idx: int | None = None
+            for idx, instr in enumerate(writer_instructions):
+                if current_offset == write_offset:
+                    write_idx = idx
+                    break
+                current_offset += instr.get_length()
+
+            if write_idx is None:
+                return None
+
+            write_instr = writer_instructions[write_idx]
+            write_output = write_instr.get_output()
+
+            # For iput/sput, the source register is the first register in output
+            src_reg = _get_dest_register(write_output)
+            if src_reg is None:
+                return None
+
+            # Trace that register backwards to a const-string
+            val = _trace_register_backward(writer_instructions, write_idx - 1, src_reg)
+            if val is not None:
+                constant_values.append(val)
+            else:
+                return None  # This write is not a constant — give up
+
+        # All writes must agree on the same value
+        unique = set(constant_values)
+        if len(unique) == 1:
+            return constant_values[0]
+
+        return None
+
+    except Exception as exc:
+        logger.debug("_resolve_field_constant failed: %s", exc)
+        return None
+
+
+def _classify_handler_body(
+    instructions: list,
+    offset_to_idx: dict[int, int],
+    handler_offset: int,
+) -> str:
+    """Classify what a single exception handler body does.
+
+    Starts at *handler_offset* and reads forward until a terminal instruction
+    (``return-*``, ``throw``, or ``goto`` leaving the handler) is found.
+
+    Returns:
+        One of:
+
+        - ``'swallows'``: handler body is empty (only ``move-exception`` then
+          ``return-void``) or has only innocuous logging before the return.
+        - ``'rethrows'``: handler body ends with ``throw``.
+        - ``'handles'``: handler body does meaningful work (invoke calls,
+          puts, etc.) before returning.
+        - ``'unknown'``: could not determine.
+    """
+    try:
+        start_idx = offset_to_idx.get(handler_offset)
+        if start_idx is None:
+            # Try nearest offset
+            nearest_offset = min(
+                offset_to_idx.keys(),
+                key=lambda o: abs(o - handler_offset),
+                default=None,
+            )
+            if nearest_offset is None or abs(nearest_offset - handler_offset) > 4:
+                return "unknown"
+            start_idx = offset_to_idx[nearest_offset]
+
+        meaningful_ops = 0
+        for idx in range(start_idx, min(start_idx + 20, len(instructions))):
+            instr = instructions[idx]
+            name = instr.get_name()
+
+            if name == "move-exception":
+                continue  # boilerplate start of any handler
+            if name == "return-void":
+                # If we saw no meaningful ops, this is a swallow
+                return "swallows" if meaningful_ops == 0 else "handles"
+            if name in ("return", "return-object", "return-wide"):
+                return "handles"
+            if name == "throw":
+                return "rethrows"
+            if name == "goto" or name.startswith("goto/"):
+                # Unconditional branch — conservative: treat as unknown
+                return "unknown"
+            if name.startswith("invoke"):
+                # A log call is the most common "swallow with logging" pattern.
+                # Detect common log classes and treat them as non-meaningful.
+                output = instr.get_output()
+                if any(log_sig in output for log_sig in (
+                    "Landroid/util/Log;",
+                    "Ljava/util/logging/Logger;",
+                    "Lorg/slf4j/Logger;",
+                    "Ltimber/log/Timber;",
+                    "printStackTrace",
+                )):
+                    continue  # logging-only call — still a swallow candidate
+                meaningful_ops += 1
+            else:
+                # iput, sput, array ops etc.
+                if not name.startswith("move") and not name.startswith("const"):
+                    meaningful_ops += 1
+
+        return "unknown"
+
+    except Exception as exc:
+        logger.debug("_classify_handler_body failed: %s", exc)
+        return "unknown"
+
+
+# ----------------------------------------------------------------------- #
+# Private helpers — existing (unchanged)
 # ----------------------------------------------------------------------- #
 
 
