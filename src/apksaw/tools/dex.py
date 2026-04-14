@@ -444,16 +444,15 @@ def _run_async(coro):
 
     asyncio.run() raises RuntimeError when called from inside a running loop
     (common in MCP server environments that use asyncio internally).  We detect
-    that case and spin up a fresh thread-local loop instead.
+    that case and run the coroutine in a separate thread with its own loop.
     """
+    import concurrent.futures
     try:
         return asyncio.run(coro)
     except RuntimeError:
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(coro)
-        finally:
-            loop.close()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, coro)
+            return future.result(timeout=300)
 
 
 def _decompile_method_jadx(session, class_name: str, method_name: str, descriptor: str) -> dict:
