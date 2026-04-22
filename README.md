@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/apksaw-logo.png" alt="Logo" width="200">
+  <img src="docs/apksaw-logo.png" alt="Logo" width="500">
 </p>
 
 <p align="center">
