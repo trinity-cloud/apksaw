@@ -1,4 +1,6 @@
-![Logo](docs/apksaw-logo.png)
+<p align="center">
+  <img src="docs/apksaw-logo.png" alt="Logo" width="200">
+</p>
 
 <p align="center">
   <h1 align="center">apksaw</h1>
