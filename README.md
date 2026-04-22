@@ -1,3 +1,5 @@
+![Logo](docs/apksaw-logo.png)
+
 <p align="center">
   <h1 align="center">apksaw</h1>
   <p align="center"><strong>AI-agent Android reverse engineering toolkit</strong></p>
