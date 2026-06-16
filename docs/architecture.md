@@ -53,7 +53,7 @@ Each source file under `src/apksaw/tools/` registers a group of related tools:
 | `security.py` | `scan_manifest_security`, `scan_crypto_issues`, `scan_network_security`, `scan_code_injection`, `scan_data_storage`, `scan_all` |
 | `security_v2.py` | `scan_crypto_issues_v2`, `scan_network_security_v2`, `scan_code_injection_v2`, `scan_all_v2` |
 | `certificates.py` | `get_signing_info`, `check_certificate_security` |
-| `native.py` | `list_native_libs`, `analyze_native_lib`, `search_native_strings`, `check_native_security`, `disassemble_function` |
+| `native.py` | `list_native_libs`, `analyze_native_lib`, `search_native_strings`, `check_native_security`, `disassemble_function`, `find_rop_gadgets`, `generate_jni_hook`, `execute_native_hook` |
 | `diff.py` | `diff_apks`, `diff_manifest`, `diff_classes`, `diff_strings`, `diff_security` |
 | `patch_analysis.py` | `analyze_security_patches`, `find_patched_methods`, `find_vulnerability_window` |
 | `fuzzer.py` | `fuzz_exported_components`, `fuzz_deep_links`, `fuzz_content_providers` |

@@ -1,13 +1,50 @@
-"""Native library (.so) analysis tools for Android APK threat analysis."""
+"""Native library (.so) analysis + exploitation tools for Android APK threat analysis.
+
+Phase 5 additions (after the original 5 static analysis tools):
+
+- ``find_rop_gadgets``    — Capstone-driven ROP gadget discovery over .text
+- ``generate_jni_hook``   — Frida JS hook script generator for ``Java_*`` exports
+- ``execute_native_hook`` — runtime Frida execution with ``confirm``-gated dry-run
+"""
 
 import re
-import string
+import subprocess  # noqa: F401 — referenced by phase-5 tests for dry-run contract
+import time
 import zipfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, NamedTuple, Optional
 
 from apksaw.server import mcp
 from apksaw.session import Session, get_session
+from apksaw.utils.adb import check_device_connected
+
+
+# ---------------------------------------------------------------------------
+# Frida Python client availability probe (used by execute_native_hook)
+# ---------------------------------------------------------------------------
+
+
+class _FridaImportStatus(NamedTuple):
+    """Result of the lazy ``import frida`` probe used by ``execute_native_hook``.
+
+    Tests patch the module-level ``_IMPORT_FRIDA`` constant with a MagicMock
+    that exposes ``available`` and ``module`` attributes — so this NamedTuple
+    shape must remain (available: bool, module: Any).
+    """
+    available: bool
+    module: Any  # noqa: ANN401 — the frida module or None
+
+
+def _try_import_frida() -> _FridaImportStatus:
+    """Resolve the frida Python client without crashing if it isn't installed."""
+    try:
+        import frida  # type: ignore[import-not-found]  # noqa: PLC0415
+        return _FridaImportStatus(available=True, module=frida)
+    except Exception:
+        return _FridaImportStatus(available=False, module=None)
+
+
+_IMPORT_FRIDA: _FridaImportStatus = _try_import_frida()
 
 # ---------------------------------------------------------------------------
 # Suspicious function name patterns
@@ -440,15 +477,6 @@ def disassemble_function(
             "status": "error",
             "message": "lief is not installed.",
             "suggestion": "pip install lief",
-        }
-
-    try:
-        from capstone import CsError  # noqa: PLC0415
-    except ImportError:
-        return {
-            "status": "error",
-            "message": "capstone is not installed.",
-            "suggestion": "pip install capstone",
         }
 
     try:
@@ -1037,4 +1065,770 @@ def check_native_security(
             "status": "error",
             "message": f"Failed to run security checks on native library: {exc}",
             "suggestion": "Ensure LIEF is installed and the library is a valid ELF binary.",
+        }
+
+
+# ===========================================================================
+# Phase 5 — Tool 6: find_rop_gadgets
+# ===========================================================================
+#
+# Capstone-driven Return-Oriented Programming gadget discovery over the
+# library's ``.text`` section. Weapons-grade native exploitation starts with
+# gadget inventory; this tool emits one candidate per ret/bx-lr terminator
+# within a sliding window of recent instructions, classified by mnemonic
+# shape so the LLM agent can pick.
+#
+# Design constraints (kept conservative by design):
+#
+# - Sliding window of 12 instructions. Longer chains exist but produce noisy
+#   candidates that distract the agent; longer chains can be re-discovered
+#   with ``disassemble_function`` for known symbols.
+# - Classifier labels by mnemonic shape, NOT by exploitability — matching
+#   the project's "scanner emits, agent reasons from it" posture.
+# - Hard cap on returned gadgets (default 50) so a 4 MB lib doesn't burn
+#   CI minutes on disassembly.
+# ===========================================================================
+
+
+# Mnemonic patterns for gadget termination.
+_TERMINATORS = frozenset({"ret", "bx"})
+
+# How far back to walk for the gadget window.
+_ROP_WINDOW_DEPTH = 12
+
+
+def _classify_gadget(window: list, arch: str) -> str:
+    """Return a human-readable kind label for a ret-terminated window.
+
+    Conservative — labels by mnemonic shape, not exploitability.
+
+    Args:
+        window: List of capstone instruction mocks ending in a ret/bx.
+        arch: Architecture string (currently informational only).
+
+    Returns:
+        One of: ``bx_lr``, ``ldp_pop_ret``, ``pop_ret``, ``ldp_ret``,
+        ``ldr_ret``, ``sp_mov_ret``, ``sp_adjust_ret``, ``ret_only``,
+        ``generic_ret``.
+    """
+    if not window:
+        return "generic_ret"
+
+    mnemonics = [str(getattr(i, "mnemonic", "") or "").lower() for i in window]
+    if not mnemonics:
+        return "generic_ret"
+
+    last = mnemonics[-1]
+    last_op = str(getattr(window[-1], "op_str", "") or "").lower()
+
+    # ARM32 thumb: 'bx lr' is the effective return
+    if last == "bx" and "lr" in last_op:
+        return "bx_lr"
+
+    seen = set(mnemonics)
+    op_strs = " ".join(
+        str(getattr(i, "op_str", "") or "").lower() for i in window
+    )
+
+    if "pop" in seen:
+        if "ldp" in seen:
+            return "ldp_pop_ret"
+        return "pop_ret"
+    if "ldp" in seen:
+        return "ldp_ret"
+    if "ldr" in seen:
+        return "ldr_ret"
+    if "mov" in seen and "sp" in op_strs:
+        return "sp_mov_ret"
+    if "add" in seen and "sp" in op_strs:
+        return "sp_adjust_ret"
+    if last == "ret" and len(window) == 1:
+        return "ret_only"
+    return "generic_ret"
+
+
+@mcp.tool()
+def find_rop_gadgets(
+    session_id: str,
+    lib_name: str,
+    arch: str = "arm64-v8a",
+    max_gadgets: int = 50,
+) -> dict:
+    """Find Return-Oriented Programming gadget *candidates* in a native library.
+
+    Walks the library's ``.text`` section with Capstone, emits one gadget
+    candidate per ret/bx-lr terminator within a sliding window of recent
+    instructions, and classifies each by mnemonic shape.
+
+    This is a **candidate generator**, not a full ROP finder like
+    ROPgadget / ropper. The scan uses a single disassembly mode per arch
+    (arm64/Thumb for armeabi, ARM64 for arm64-v8a) and resets the window
+    after each terminator, so it will **miss**:
+
+    - overlapping gadgets (the window doesn't slide)
+    - Thumb-interleaved code on armeabi-v7a (only one mode is scanned)
+
+    For exhaustive ROP coverage, export ``.text`` and run a dedicated
+    tool (ropgadget / ropper) externally — the LLM agent can orchestrate
+    that from this tool's output.
+
+    Args:
+        session_id: Active analysis session ID returned by load_apk.
+        lib_name: Library file name, e.g. ``libfoo.so``.
+        arch: ABI directory name (default ``arm64-v8a``). Supported: arm64-v8a,
+            armeabi-v7a, x86, x86_64.
+        max_gadgets: Cap on returned gadgets (default 50). Multi-MB libraries
+            pre-cap disassembly time so CI stays bounded.
+
+    Returns:
+        dict: ``{"status": "ok", "data": {"gadgets": [...], "count": N,
+        "truncated": bool, "lib_name": str, "arch": str}}``
+
+        Each gadget has ``kind`` (e.g. ``pop_ret``), ``address`` (hex of
+        terminator), ``start_address`` (hex of window start), and
+        ``instructions`` (list of ``{address, mnemonic, op_str}``).
+    """
+    try:
+        import lief  # noqa: PLC0415
+    except ImportError:
+        return {
+            "status": "error",
+            "message": "lief is not installed.",
+            "suggestion": "pip install lief",
+        }
+
+    try:
+        session = get_session(session_id)
+        lib_path_in_apk = f"lib/{arch}/{lib_name}"
+
+        try:
+            so_path = _extract_so(session, lib_path_in_apk)
+        except KeyError:
+            return {
+                "status": "error",
+                "message": f"Library '{lib_path_in_apk}' not found in APK.",
+                "suggestion": "Use list_native_libs to see available libraries.",
+            }
+
+        binary = lief.ELF.parse(str(so_path))
+        if binary is None:
+            return {
+                "status": "error",
+                "message": f"LIEF could not parse '{lib_name}'.",
+                "suggestion": "The file may be corrupted.",
+            }
+
+        # Locate .text section. If missing or empty, no executable gadgets.
+        text_section = None
+        try:
+            for sec in binary.sections:
+                if getattr(sec, "name", "") == ".text":
+                    text_section = sec
+                    break
+        except Exception:
+            text_section = None
+
+        if text_section is None or int(getattr(text_section, "size", 0) or 0) == 0:
+            return {
+                "status": "ok",
+                "data": {
+                    "lib_name": lib_name,
+                    "arch": arch,
+                    "gadgets": [],
+                    "count": 0,
+                    "truncated": False,
+                },
+            }
+
+        md = _capstone_for_arch(arch)
+        if md is None:
+            return {
+                "status": "error",
+                "message": f"Unsupported architecture for ROP scan: {arch}",
+                "suggestion": "Supported architectures: arm64-v8a, armeabi-v7a, x86, x86_64.",
+            }
+
+        try:
+            raw = bytes(text_section.content)
+        except Exception:
+            raw = b""
+        base_vaddr = int(getattr(text_section, "virtual_address", 0) or 0)
+
+        gadgets: list[dict] = []
+        truncated = False
+        window: list = []
+
+        try:
+            for insn in md.disasm(raw, base_vaddr):
+                window.append(insn)
+                if len(window) > _ROP_WINDOW_DEPTH:
+                    window = window[-_ROP_WINDOW_DEPTH:]
+
+                last_mnemonic = str(getattr(insn, "mnemonic", "") or "").lower()
+                last_op_str = str(getattr(insn, "op_str", "") or "").lower()
+
+                # bx without lr is a regular indirect branch, not a return.
+                if last_mnemonic == "bx" and "lr" not in last_op_str:
+                    continue
+
+                is_terminator = last_mnemonic in _TERMINATORS
+                if not is_terminator:
+                    continue
+                if not window:
+                    continue
+
+                kind = _classify_gadget(window, arch)
+                gadgets.append({
+                    "kind": kind,
+                    "address": hex(int(getattr(window[-1], "address", 0) or 0)),
+                    "start_address": hex(int(getattr(window[0], "address", 0) or 0)),
+                    "instructions": [
+                        {
+                            "address": hex(int(getattr(i, "address", 0) or 0)),
+                            "mnemonic": str(getattr(i, "mnemonic", "") or ""),
+                            "op_str": str(getattr(i, "op_str", "") or ""),
+                        } for i in window
+                    ],
+                })
+                window = []
+                if len(gadgets) >= max_gadgets:
+                    truncated = True
+                    break
+        except Exception:
+            # Capstone failures mid-stream: emit whatever we have so far.
+            pass
+
+        return {
+            "status": "ok",
+            "data": {
+                "lib_name": lib_name,
+                "arch": arch,
+                "count": len(gadgets),
+                "truncated": truncated,
+                "gadgets": gadgets,
+            },
+        }
+    except KeyError as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+            "suggestion": "Call load_apk first to create a session.",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Failed to scan for ROP gadgets: {exc}",
+            "suggestion": "Ensure LIEF and Capstone are installed and the .so is a valid ELF.",
+        }
+
+
+# ===========================================================================
+# Phase 5 — Tool 7: generate_jni_hook
+# ===========================================================================
+#
+# Produces a Frida JS script that hooks every ``Java_<class>_<method>``
+# export from a native library. The classic Android high-grade capability
+# gap: many banking / fintech apps move crypto, auth, and license validation
+# into .so native code, and the only sane way to peek inside is to hook
+# the JNI entry points from inside a live target process.
+#
+# Output:
+#   <session.workspace>/native_hooks/<lib_name>_jni.js
+#
+# Designed for compose-with: ``execute_native_hook`` can take the produced
+# JS path directly as input, so the verb chain is:
+#
+#   analyze_native_lib(lib) → generate_jni_hook(lib) → execute_native_hook(js)
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# JNI demangling (Phase 5 — Tool 7 helpers)
+# ---------------------------------------------------------------------------
+#
+# JNI symbol mangling (per the JNI spec, Chapter 11.3):
+#   Java_<fully-qualified-class>_<method>
+#
+# - '/'        → '_' (package separator to underscore)
+# - '_'        → '_1' (underscore was escaped in C name)
+# - ';'        → '_2'
+# - '['        → '_3'
+# - '\\xNN'    → '_0NNNN' (Unicode char by code point)
+# - overloads  → '__' suffix before method signature
+#
+# This module implements a simple, correct-for-common-symbols demangler
+# that walks the symbol char-by-char and handles the core escape set.
+# Edge cases (_0NNNN for non-ASCII, double-underscore overload markers)
+# are rejected gracefully with return-None so the caller can emit a clean
+# per-skipped log instead of a broken ``Java.use`` call.
+# ---------------------------------------------------------------------------
+
+
+def _parse_jni_export(symbol: str) -> tuple[str, str] | None:
+    """Parse a ``Java_<cls>_<method>`` symbol into ``(class_name, method_name)``.
+
+    Returns ``None`` if the symbol does not conform to the JNI mangling
+    scheme (overload markers (`__`), Unicode escapes (`_0xxxx`), or
+    missing method separator). Agents should reconcile ambiguous class
+    names with ``dex.list_classes``.
+    """
+    if not symbol or not symbol.startswith("Java_"):
+        return None
+
+    body = symbol[5:]  # strip "Java_"
+    n = len(body)
+    if n == 0:
+        return None
+
+    # ---- Locate the method separator (the last *bare* underscore) ----
+    # A bare underscore is one that is NOT part of an escape sequence
+    # (_1, _2, _3, _0xxxx, __).  Escape pairs are skipped entirely.
+    method_sep = -1
+    i = 0
+    while i < n:
+        if body[i] != "_":
+            i += 1
+            continue
+        # ch == '_'
+        if i + 1 >= n:
+            # trailing '_' — this is the method separator with
+            # nothing after it.  Mark it and stop.
+            method_sep = i
+            break
+        nxt = body[i + 1]
+        if nxt in ("1", "2", "3"):
+            # _1 / _2 / _3 → escape sequence, not a separator
+            i += 2
+            continue
+        if nxt == "_" or nxt == "0":
+            # __ overload or _0xxxx Unicode — reject the whole symbol.
+            return None
+        # otherwise nxt is a regular character → bare underscore
+        method_sep = i
+        i += 1
+
+    if method_sep == -1:
+        return None  # no method separator found
+
+    # ---- Build class name from body[:method_sep] ----
+    class_chars: list[str] = []
+    i = 0
+    while i < method_sep:
+        ch = body[i]
+        if ch != "_":
+            class_chars.append(ch)
+            i += 1
+            continue
+        # ch == '_' — we already know from the first pass that this
+        # underscore is either bare or part of an escape pair.
+        nxt = body[i + 1]
+        if nxt == "1":
+            class_chars.append("_")
+        elif nxt == "2":
+            class_chars.append(";")
+        elif nxt == "3":
+            class_chars.append("[")
+        else:
+            # bare underscore — package separator (originally '/')
+            class_chars.append("/")
+        i += 2 if nxt in ("1", "2", "3") else 1
+
+    cls = "".join(class_chars).replace("/", ".")
+
+    # ---- Method name is everything after the separator ----
+    method = body[method_sep + 1:]
+    if not method:
+        return None
+
+    return cls, method
+
+
+@mcp.tool()
+def generate_jni_hook(
+    session_id: str,
+    lib_name: str,
+    arch: str = "arm64-v8a",
+    class_filter: str | None = None,
+) -> dict:
+    """Generate a Frida JS script that hooks all ``Java_*`` exports from a library.
+
+    For each ``Java_<class>_<method>`` symbol in the named library, generates
+    a ``Java.use(class).method.implementation`` swap that logs the call,
+    forwards to the native implementation, and ``send()``s a structured
+    payload back to the Frida client. The composed script is written to
+    ``<session.workspace>/native_hooks/<lib>_jni.js``.
+
+    When the library exports no JNI symbols, returns ``status:ok`` with
+    ``hooks=[]`` and a verification message — the library may be unloaded
+    by the target process, or the symbols may be private (dlsym rather
+    than JNI_OnLoad).
+
+    Args:
+        session_id: Active analysis session ID returned by load_apk.
+        lib_name: Library file name, e.g. ``libfoo.so``.
+        arch: ABI directory name (default ``arm64-v8a``).
+        class_filter: Optional substring restricting hooks to symbols whose
+            parsed class name contains the filter (case-insensitive).
+
+    Returns:
+        dict: ``{"status": "ok", "data": {"hooks": [...], "script": str,
+        "file_path": str, "message": str}}``
+
+        Each ``hooks`` entry has ``symbol``, ``class_name``, ``method_name``,
+        and ``address``.
+    """
+    try:
+        import lief  # noqa: PLC0415
+    except ImportError:
+        return {
+            "status": "error",
+            "message": "lief is not installed.",
+            "suggestion": "pip install lief",
+        }
+
+    try:
+        session = get_session(session_id)
+        lib_path_in_apk = f"lib/{arch}/{lib_name}"
+
+        try:
+            so_path = _extract_so(session, lib_path_in_apk)
+        except KeyError:
+            return {
+                "status": "error",
+                "message": f"Library '{lib_path_in_apk}' not found in APK.",
+                "suggestion": "Use list_native_libs to see available libraries.",
+            }
+
+        binary = lief.ELF.parse(str(so_path))
+        if binary is None:
+            return {
+                "status": "error",
+                "message": f"LIEF could not parse '{lib_name}'.",
+                "suggestion": "The file may be corrupted.",
+            }
+
+        raw_exports: list[dict] = []
+        try:
+            exports = list(binary.exported_functions or [])
+        except Exception:
+            exports = []
+
+        for fn in exports:
+            name = str(getattr(fn, "name", "") or "")
+            parsed = _parse_jni_export(name)
+            if not parsed:
+                continue
+            cls, method = parsed
+
+            if class_filter:
+                cf = str(class_filter).strip().lower()
+                if cf and cf not in cls.lower():
+                    continue
+
+            try:
+                addr = int(getattr(fn, "address", 0) or 0)
+            except Exception:
+                addr = 0
+
+            raw_exports.append({
+                "symbol": name,
+                "class_name": cls,
+                "method_name": method,
+                "address": hex(addr),
+            })
+
+        if not raw_exports:
+            return {
+                "status": "ok",
+                "data": {
+                    "lib_name": lib_name,
+                    "arch": arch,
+                    "hooks": [],
+                    "script": "",
+                    "file_path": "",
+                    "message": (
+                        "No Java_* JNI exports found in this library — verify "
+                        "the library is actually loaded by the target app, "
+                        "and that any private registration in JNI_OnLoad is "
+                        "covered by listing exported symbols."
+                    ),
+                },
+            }
+
+        # Compose the Frida JS: one Java.use().method.implementation swap per hook.
+        # A JS-side helper defensively stringifies each argument so send()
+        # doesn't choke on non-serializable Java object handles. Static
+        # native methods are not detected at the ELF level — the generated
+        # hook binds to the instance. If the agent knows the method is
+        # static, they should adjust the script manually.
+        script_parts: list[str] = [
+            "// Generated by apksaw generate_jni_hook — review before running on a target.\n",
+            "// Source: " + lib_path_in_apk + "\n",
+            "function args_to_json(args) {\n"
+            "    var a = [];\n"
+            "    for (var i = 0; i < args.length; i++) {\n"
+            "        try { a.push(String(args[i])); } catch (_) { a.push(null); }\n"
+            "    }\n"
+            "    return a;\n"
+            "}\n\n",
+            "Java.perform(function () {\n",
+        ]
+        for hook in raw_exports:
+            script_parts.append(
+                "    try {{\n"
+                "        var cls = Java.use(\"{cls}\");\n"
+                "        cls.{mth}.implementation = function () {{\n"
+                "            send({{__apksaw_kind: \"jni_call\","
+                " method: \"{mth}\","
+                " args: args_to_json(arguments)}});\n"
+                "            var ret = this.{mth}.apply(this, arguments);\n"
+                "            send({{__apksaw_kind: \"jni_return\","
+                " method: \"{mth}\","
+                " value: ret !== undefined ? String(ret) : null}});\n"
+                "            return ret;\n"
+                "        }};\n"
+                "        console.log(\"[apksaw] hooked {cls}.{mth}\");\n"
+                "    }} catch (e) {{\n"
+                "        console.log(\"[apksaw] skipped {cls}.{mth}: \" + e);\n"
+                "    }}\n\n".format(
+                    cls=hook["class_name"],
+                    mth=hook["method_name"],
+                )
+            )
+        script_parts.append("});\n")
+        script = "".join(script_parts)
+
+        out_dir = session.workspace / "native_hooks"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^\w\-.]", "_", lib_name)
+        out_path = out_dir / f"{safe_name}_jni.js"
+        out_path.write_text(script)
+
+        return {
+            "status": "ok",
+            "data": {
+                "lib_name": lib_name,
+                "arch": arch,
+                "hooks": raw_exports,
+                "script": script,
+                "file_path": str(out_path),
+                "message": (
+                    f"Generated {len(raw_exports)} JNI hook(s). "
+                    "Run via execute_native_hook (gadget path) or: "
+                    f"frida -U -l {out_path} -f {session.package_name} --no-pause"
+                    if session.package_name else
+                    f"Generated {len(raw_exports)} JNI hook(s). "
+                    f"Run via: frida -U -l {out_path}"
+                ),
+            },
+        }
+    except KeyError as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+            "suggestion": "Call load_apk first to create a session.",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Failed to generate JNI hook script: {exc}",
+            "suggestion": "Ensure LIEF is installed and the library is a valid ELF binary.",
+        }
+
+
+# ===========================================================================
+# Phase 5 — Tool 8: execute_native_hook
+# ===========================================================================
+#
+# Runtime execution of a generated Frida JS hook script against the target
+# app on a connected device. Closes the verify loop that the static
+# ``generate_jni_hook`` leaves open: the agent now has *both* the candidate
+# exploit lever (the script) and the means to drive it. Same posture as
+# ``runtime.run_frida_script`` — confirm-gated dry-run, ADB device check,
+# frida Python client probe.
+# ===========================================================================
+
+
+def _frida_plan_response(js_path: str, package: str | None, capture_seconds: int) -> dict:
+    """Build the dry-run plan for execute_native_hook (no side effects)."""
+    command = f"frida -U -l {js_path}"
+    if package:
+        command += f" -f {package} --no-pause"
+    return {
+        "status": "ok",
+        "data": {
+            "plan": True,
+            "command": command,
+            "tool_check": {
+                "adb_device_required": True,
+                "frida_python_required": True,
+            },
+            "steps": [
+                "Verify `adb devices` lists the target device",
+                "Verify the frida Python client is importable (uv add frida-tools)",
+                "Spawn/attach the target app via frida.get_device_manager()",
+                "Load the JS hook script into the spawned session",
+                f"Capture send() payloads for {capture_seconds}s",
+                "Return classified findings via the message handler",
+            ],
+        },
+    }
+
+
+@mcp.tool()
+def execute_native_hook(
+    session_id: str,
+    js_path: str,
+    package: str | None = None,
+    capture_seconds: int = 5,
+    confirm: bool = False,
+) -> dict:
+    """Execute a generated Frida JS hook script against the target app.
+
+    Spawns (or attaches to) the target package via the frida Python
+    client, loads the JS script, and collects ``send()`` payloads for
+    ``capture_seconds`` before unloading. Output shape mirrors
+    ``runtime.capture_runtime_secrets`` so downstream reasoning is uniform
+    across Java and native hooks.
+
+    Safety:
+
+    - ``confirm=False`` returns a plan + tool_check WITHOUT spawning any
+      process or touching the device. ``subprocess`` is not invoked in
+      this mode (same dry-run posture as ``exploit_gen`` and
+      ``runtime.repackage_with_gadget``).
+    - ``confirm=True`` requires BOTH an ADB device AND a working frida
+      Python install. If either is missing, the tool declines and reports
+      the missing dependency rather than failing mid-pipeline.
+
+    Args:
+        session_id: Active analysis session ID.
+        js_path: Absolute path to the JS hook script (typically produced
+            by ``generate_jni_hook``).
+        package: Target Android package name. Required when ``confirm=True``
+            — there is no reliable "attach to whatever is running" on Android,
+            so the tool spawns and attaches to this package. Ignored in the
+            ``confirm=False`` dry-run (it is only echoed into the plan command).
+        capture_seconds: How long to listen for ``send()`` payloads
+            (default 5).
+        confirm: Must be ``True`` to actually spawn / attach. ``False``
+            returns a dry-run plan only.
+
+    Returns:
+        Dry-run: ``{"status": "ok", "data": {"plan": True, "command": str, ...}}``
+        Live:    ``{"status": "ok", "data": {"findings": [...], "captured_count": N, ...}}``
+        Error:   ``{"status": "error", "message": str, "suggestion": str}``
+    """
+    try:
+        js_file = Path(js_path)
+        if not js_file.exists():
+            return {
+                "status": "error",
+                "message": f"Hook script not found at: {js_path}",
+                "suggestion": "Generate it with generate_jni_hook first.",
+            }
+
+        if not confirm:
+            return _frida_plan_response(str(js_file), package, capture_seconds)
+
+        if not check_device_connected():
+            return {
+                "status": "error",
+                "message": "No ADB device connected.",
+                "suggestion": "Connect a device and verify with `adb devices`.",
+            }
+
+        if not _IMPORT_FRIDA.available:
+            return {
+                "status": "error",
+                "message": (
+                    "frida Python client is not importable. "
+                    "execute_native_hook requires frida-tools to spawn the target."
+                ),
+                "suggestion": "Install with: uv add frida-tools (or pip install frida-tools).",
+            }
+
+        # Live execution. Failures here are reported as status:error so the
+        # agent can iterate on the script (e.g. correct a missing class name,
+        # adjust the import path, etc.).
+
+        # package is required for live execution — there is no reliable
+        # "attach to whatever is running" on Android. If the caller has the
+        # package name, they must supply it.
+        if not package:
+            return {
+                "status": "error",
+                "message": "package is required for execute_native_hook when confirm=True.",
+                "suggestion": (
+                    "Pass the target app's package name (e.g. the session's "
+                    "package_name) to spawn and attach."
+                ),
+            }
+
+        try:
+            frida_mod = _IMPORT_FRIDA.module
+            mgr = frida_mod.get_device_manager()
+            device = mgr.get_usb_device(timeout=5)
+            pid = device.spawn([package])
+            session = device.attach(pid)
+
+            captured: list[dict] = []
+
+            def _on_message(message, _data):
+                if isinstance(message, dict):
+                    captured.append(message)
+
+            script = session.create_script(js_file.read_text())
+            script.on("message", _on_message)
+            script.load()
+
+            if pid is not None:
+                try:
+                    device.resume(pid)
+                except Exception:
+                    pass
+
+            time.sleep(max(0, int(capture_seconds)))
+
+            try:
+                script.unload()
+            except Exception:
+                pass
+
+            summary: dict[str, int] = {}
+            for msg in captured:
+                payload = msg.get("payload") if isinstance(msg, dict) else None
+                kind = payload.get("__apksaw_kind") if isinstance(payload, dict) else None
+                if kind:
+                    summary[kind] = summary.get(kind, 0) + 1
+
+            return {
+                "status": "ok",
+                "data": {
+                    "package": package,
+                    "pid": pid,
+                    "captured_count": len(captured),
+                    "findings": captured,
+                    "capture_seconds": capture_seconds,
+                    "summary": summary,
+                    "tool_check": {
+                        "adb_device_required": True,
+                        "frida_python_required": True,
+                    },
+                },
+            }
+        except Exception as exec_exc:
+            return {
+                "status": "error",
+                "message": f"Failed to execute native hook: {exec_exc}",
+                "suggestion": (
+                    "Verify the target accepts the spawn — Frida gadget installed "
+                    "and listening, or root with frida-server running."
+                ),
+            }
+    except Exception as outer_exc:
+        return {
+            "status": "error",
+            "message": f"Failed to plan / execute native hook: {outer_exc}",
+            "suggestion": "Re-check inputs (js_path, package) and confirm session is alive.",
         }

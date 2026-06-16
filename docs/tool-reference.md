@@ -1,6 +1,6 @@
 # Tool Reference
 
-apksaw exposes **97 MCP tools**. You rarely call them by name — your coding agent picks the right ones from your natural-language request. This page is the full inventory for when you want to know exactly what's available, or wire a tool into a script.
+apksaw exposes **100 MCP tools**. You rarely call them by name — your coding agent picks the right ones from your natural-language request. This page is the full inventory for when you want to know exactly what's available, or wire a tool into a script.
 
 Tools fall into two categories:
 
@@ -45,6 +45,9 @@ These tools produce results, not just data. One tool call, structured output.
 | `generate_bypass_script` | Generates targeted Frida bypass scripts for detected anti-analysis categories. |
 | `detect_obfuscation` | Analyzes class naming patterns to identify obfuscator (R8, ProGuard, DexGuard) and confidence level. |
 | `check_native_security` | Checks stack canary, NX, RELRO, PIE, Fortify on native `.so` libraries. |
+| `find_rop_gadgets` | Capstone sweep of a native lib's `.text` for ROP gadget candidates, classified by mnemonic shape. Candidate generator (reliable on arm64/x86; best-effort on arm32), not a full ROPgadget/ropper replacement. |
+| `generate_jni_hook` | Demangles `Java_*` JNI exports from a `.so` and writes a Frida JS script that hooks each one, logging args/returns via `send()`. |
+| `execute_native_hook` | Runs a generated Frida hook script against the target app and captures `send()` payloads. Dry-run by default; live execution behind `confirm=True` + ADB device + Frida. |
 
 ## Infrastructure — tools that give the agent hands
 
@@ -66,7 +69,7 @@ These tools provide structured data that the agent interprets and reasons about.
 `diff_apks` | `diff_manifest` | `diff_classes` | `diff_strings` | `diff_security` | `analyze_security_patches` | `find_patched_methods` | `find_vulnerability_window`
 
 **Native analysis:**
-`list_native_libs` | `analyze_native_lib` | `disassemble_function` | `search_native_strings` | `check_native_security`
+`list_native_libs` | `analyze_native_lib` | `disassemble_function` | `search_native_strings` | `check_native_security` | `find_rop_gadgets` | `generate_jni_hook` | `execute_native_hook`
 
 **Runtime execution:**
 `repackage_with_gadget` | `run_frida_script` | `capture_runtime_secrets` | `prepare_frida_apk`
