@@ -28,6 +28,7 @@ nav:
     - Certificates: tools/certificates.md
     - Native: tools/native.md
     - Dynamic: tools/dynamic.md
+    - Runtime Execution: tools/runtime.md
   - Case Studies:
     - Hinge: case-studies/hinge-audit.md
     - Kimi AI: case-studies/kimi-audit.md
