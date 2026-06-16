@@ -1,5 +1,7 @@
 # Case Study: Kimi AI (com.moonshot.kimichat) Security Audit
 
+> **Disclosure status.** This audit was performed on a publicly distributed release build for security research. Hardcoded keys and other sensitive identifiers have been **redacted** in this writeup. These findings have **not yet been disclosed** to the vendor — they are published to document apksaw's workflow, not as a coordinated advisory. If you audit an app you do not own, follow the vendor's responsible-disclosure or bug-bounty process before publishing anything. apksaw is designed first for auditing apps **you own**, where this question doesn't arise.
+
 **Target:** Kimi v2.6.7 (build 322), Android AI chat app by Moonshot AI
 **Device:** Pixel 10a, Android 16, non-rooted, Canadian SIM
 **Time:** Approximately 4 hours from APK pull to final report
@@ -69,7 +71,7 @@ The scanner's most prominent false positive was the WebView finding. Flagging `s
 
 1. **JiGuang VerifySDK TLS bypass** — `cn.jiguang.verifysdk.i.o$1.checkServerTrusted()` accepts any certificate (checks non-null only, no chain validation). `cn.jiguang.verifysdk.i.t` catches and swallows all TrustManager exceptions. Affects phone number verification flow. Exploitable via network MITM.
 
-2. **Hardcoded AES key** `"yuNttCSojTyxZods"` in class `LP/k` — used as a fallback key for AES/ECB/PKCS5Padding decryption of WebView JavaScript assets. The key is in the APK and the algorithm is ECB mode.
+2. **Hardcoded AES key** (`yuNt…[redacted]`) in class `LP/k` — used as a fallback key for AES/ECB/PKCS5Padding decryption of WebView JavaScript assets. The key is in the APK and the algorithm is ECB mode.
 
 3. **AuthActivity3 null-caller bypass** — `getCallingActivity()` returns null when started via `startActivity()` (not `startActivityForResult()`), and the null check returns `true`, bypassing certificate verification of the calling app.
 

@@ -1,5 +1,7 @@
 # Case Study: Hinge (co.hinge.app) Security Audit
 
+> **Disclosure status.** This audit was performed on a publicly distributed release build for security research. Live credentials and other sensitive identifiers have been **redacted** in this writeup. These findings have **not yet been disclosed** to the vendor — they are published to document apksaw's workflow, not as a coordinated advisory. If you audit an app you do not own, follow the vendor's responsible-disclosure or bug-bounty process before publishing anything. apksaw is designed first for auditing apps **you own**, where this question doesn't arise.
+
 **Target:** Hinge v9.116.0 (build 168200970), Android dating app by Match Group
 **Device:** Pixel 10a, Android 16, non-rooted
 **Time:** Approximately 3 hours from APK pull to final report
@@ -43,9 +45,9 @@ Examples of false positives the agent caught by reading decompiled code:
 For confirmed findings, the agent tested exploitability:
 
 **Hardcoded API keys.** `extract_secrets` found 3 Google API keys and a Braze SDK key. The agent tested each with `curl`:
-- **Google Geocoding key** (`AIzaSyCgxoEULOl_MNr26KKHFWScYRf9vemMx4E`): unrestricted, returns geocoding results from any client — billable to Hinge's Google Cloud account
-- **Braze SDK key** (`1d3dfa7b-4370-4ba4-8efb-3498c43f4db0`): valid, the SDK config endpoint returned 160 internal user attributes and 52 tracked event names
-- **AppsFlyer dev key** (`XkJdrCAFbLCxnQ4SH7xon6`): accepted spoofed S2S attribution events
+- **Google Geocoding key** (`AIzaSyCgxo…[redacted]`): unrestricted, returns geocoding results from any client — billable to Hinge's Google Cloud account
+- **Braze SDK key** (`1d3dfa7b-…[redacted]`): valid, the SDK config endpoint returned 160 internal user attributes and 52 tracked event names
+- **AppsFlyer dev key** (`XkJd…[redacted]`): accepted spoofed S2S attribution events
 - **Two Google Places keys**: properly restricted to the Android package signature (not exploitable from outside the app)
 
 **Deep link testing.** `get_manifest` and `get_components` identified exported activities with `hinge://` scheme handlers. The agent mapped 50+ internal routes via `search_strings`, then used ADB to demonstrate forced navigation to sensitive screens (data export, profile editor, dating preferences). Screenshots were captured showing successful navigation.
