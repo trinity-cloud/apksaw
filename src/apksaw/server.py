@@ -36,6 +36,7 @@ from .tools import yara_scan  # noqa: F401, E402
 from .tools import protobuf  # noqa: F401, E402
 from .tools import fuzzer  # noqa: F401, E402
 from .tools import fuzzer_v2  # noqa: F401, E402
+from .tools import anti_analysis  # noqa: F401, E402
 from .tools import runtime  # noqa: F401, E402
 from .tools import exploit_gen  # noqa: F401, E402
 
