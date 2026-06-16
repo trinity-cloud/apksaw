@@ -195,12 +195,6 @@ def _get_nsc_info(apk) -> dict:
     }
 
     # Locate the NSC resource — filename varies (nsc.xml, network_security_config.xml…)
-    manifest_elem = apk.get_android_manifest_xml()
-    app_elem = manifest_elem.find("application")
-    nsc_attr = None
-    if app_elem is not None:
-        nsc_attr = _attr(app_elem, "networkSecurityConfig")
-
     # Try the canonical filename first, then iterate all res/xml/ files
     candidate_files: list[str] = ["res/xml/network_security_config.xml"]
     try:
@@ -366,7 +360,7 @@ def _extract_security_annotations(source_old: str, source_new: str) -> list[dict
     # Input validation added
     for pattern, kind, label in _VALIDATION_PATTERNS:
         compiled = re.compile(pattern, re.IGNORECASE)
-        new_hits = [l for l in added_lines if compiled.search(l)]
+        new_hits = [line for line in added_lines if compiled.search(line)]
         if new_hits:
             annotations.append({
                 "type": "input_validation_added",
@@ -378,7 +372,7 @@ def _extract_security_annotations(source_old: str, source_new: str) -> list[dict
 
     # Exception handling added around security operations
     new_has_try = any(
-        re.search(r"\btry\b|:try_start_", l, re.IGNORECASE) for l in added_lines
+        re.search(r"\btry\b|:try_start_", line, re.IGNORECASE) for line in added_lines
     )
     old_has_try = _source_has_try_catch(source_old)
     if new_has_try and not old_has_try:
@@ -394,7 +388,7 @@ def _extract_security_annotations(source_old: str, source_new: str) -> list[dict
     for _class_re, _method_re, api_label in _DANGEROUS_APIS:
         # Approximate: look for the method name substring in removed lines
         short_name = _method_re.replace("\\", "").replace("(", "").replace(")", "")
-        if any(short_name in l for l in removed_lines):
+        if any(short_name in line for line in removed_lines):
             annotations.append({
                 "type": "dangerous_api_removed",
                 "api": api_label,
@@ -471,7 +465,7 @@ def _poc_for_mitm(domain: str) -> list[str]:
     return [
         f"# Route device through Burp/mitmproxy, then test: https://{domain}",
         "# Use Frida SSL bypass script: frida -U -f <package> -l ssl_bypass.js",
-        f"# Or: adb shell settings put global http_proxy <your_ip>:8080",
+        "# Or: adb shell settings put global http_proxy <your_ip>:8080",
         f"# curl -k https://{domain}  # verify traffic is visible in proxy",
     ]
 
@@ -480,19 +474,19 @@ def _poc_for_dangerous_api(api_label: str, package: str, component: str) -> list
     """Generic PoC hint for a dangerous API removed in the new version."""
     if "Runtime.exec" in api_label:
         return [
-            f"# Old APK exposed Runtime.exec — reach it via exported component:",
+            "# Old APK exposed Runtime.exec — reach it via exported component:",
             f"adb shell am start -n {package}/{component} --es cmd 'id'",
         ]
     if "addJavascriptInterface" in api_label:
         return [
-            f"# Old APK has addJavascriptInterface — load attacker HTML in WebView:",
+            "# Old APK has addJavascriptInterface — load attacker HTML in WebView:",
             f"adb shell am start -n {package}/{component} "
             f"--es url 'file:///sdcard/attack.html'",
             "# attack.html: <script>jsInterface.execCommand('id')</script>",
         ]
     if "loadUrl" in api_label:
         return [
-            f"# Old APK may allow arbitrary loadUrl — attempt file:// or javascript: URI:",
+            "# Old APK may allow arbitrary loadUrl — attempt file:// or javascript: URI:",
             f"adb shell am start -n {package}/{component} "
             f"--es url 'javascript:alert(document.cookie)'",
         ]
@@ -579,7 +573,7 @@ def analyze_security_patches(session_id_old: str, session_id_new: str) -> dict:
                     "type": "component_permission_added",
                     "component": comp_name,
                     "tag": tag,
-                    "old_value": f"exported=true, permission=none",
+                    "old_value": "exported=true, permission=none",
                     "new_value": f"exported=true, permission={new_perm}",
                     "severity": "high",
                     "implication": (
@@ -630,7 +624,7 @@ def analyze_security_patches(session_id_old: str, session_id_new: str) -> dict:
                     "component": new_c["name"],
                     "tag": new_c["tag"],
                     "old_value": "did not exist",
-                    "new_value": f"exported=true, permission=none",
+                    "new_value": "exported=true, permission=none",
                     "severity": "medium",
                     "implication": (
                         f"Newly added {new_c['tag']} '{new_c['name']}' is exported "
@@ -672,7 +666,7 @@ def analyze_security_patches(session_id_old: str, session_id_new: str) -> dict:
                     "type": "permission_added",
                     "permission": perm,
                     "old_value": "not declared",
-                    "new_value": f"declared in new APK",
+                    "new_value": "declared in new APK",
                     "severity": severity,
                     "implication": (
                         f"New permission '{perm}' added. "
@@ -695,7 +689,7 @@ def analyze_security_patches(session_id_old: str, session_id_new: str) -> dict:
                 patches.append({
                     "type": "dangerous_permission_removed",
                     "permission": perm,
-                    "old_value": f"declared — app had broad access",
+                    "old_value": "declared — app had broad access",
                     "new_value": "removed in new APK",
                     "severity": "medium",
                     "implication": (
@@ -1142,7 +1136,7 @@ def find_vulnerability_window(session_id_old: str, session_id_new: str) -> dict:
     """
     try:
         old_session = get_session(session_id_old)
-        new_session = get_session(session_id_new)
+        get_session(session_id_new)  # validate the new session exists
         old_apk = old_session.apk
 
         package_name = old_apk.get_package()
@@ -1164,7 +1158,6 @@ def find_vulnerability_window(session_id_old: str, session_id_new: str) -> dict:
         default_component = (
             exported_components[0]["name"] if exported_components else f"{package_name}.MainActivity"
         )
-        default_tag = exported_components[0]["tag"] if exported_components else "activity"
 
         vulnerabilities: list[dict] = []
 
@@ -1289,8 +1282,8 @@ def find_vulnerability_window(session_id_old: str, session_id_new: str) -> dict:
                     "new_version_behavior": "debuggable=false",
                     "poc_commands": [
                         f"adb shell run-as {package_name} ls -la",
-                        f"adb jdwp  # find PID",
-                        f"adb forward tcp:8700 jdwp:<pid>",
+                        "adb jdwp  # find PID",
+                        "adb forward tcp:8700 jdwp:<pid>",
                         "jdb -attach localhost:8700",
                         "# Or: Android Studio debugger attach to process",
                     ],
@@ -1337,13 +1330,11 @@ def find_vulnerability_window(session_id_old: str, session_id_new: str) -> dict:
 
                 # Find the best exported component to reach the vulnerable code from
                 poc_comp = default_component
-                poc_tag = default_tag
                 for site in removed_callsites:
                     class_part = site.split("->")[0] if "->" in site else site
                     for comp in exported_components:
                         if comp["name"].split(".")[-1] in class_part:
                             poc_comp = comp["name"]
-                            poc_tag = comp["tag"]
                             break
 
                 poc_cmds = _poc_for_dangerous_api(api_label, package_name, poc_comp)
@@ -1404,7 +1395,7 @@ def find_vulnerability_window(session_id_old: str, session_id_new: str) -> dict:
                     "old_version_behavior": patch.get("old_value"),
                     "new_version_behavior": patch.get("new_value"),
                     "poc_commands": [
-                        f"# Verify the old APK has the permission:",
+                        "# Verify the old APK has the permission:",
                         f"aapt dump permissions <old_apk>.apk | grep '{perm}'",
                         f"# At runtime, the old APK can access: {perm}",
                     ],
@@ -1541,7 +1532,7 @@ def find_vulnerability_window(session_id_old: str, session_id_new: str) -> dict:
                             "old_version_behavior": "No exception handling around security operation",
                             "new_version_behavior": "try-catch added",
                             "poc_commands": [
-                                f"# Trigger the exception path in the old APK:",
+                                "# Trigger the exception path in the old APK:",
                                 f"# Provide malformed input to {method_name} and observe behavior",
                                 f"adb shell am start -n {package_name}/{default_component} --es bad_input 'AAAA' * 1000",
                             ],

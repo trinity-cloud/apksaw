@@ -1,8 +1,7 @@
 """Tests for session management: create_session, get_session, list_sessions."""
 
 import hashlib
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 

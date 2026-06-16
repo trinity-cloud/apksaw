@@ -16,7 +16,7 @@ import hashlib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .config import WORKSPACES_DIR, ensure_dirs
 from . import db

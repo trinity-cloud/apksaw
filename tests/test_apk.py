@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import os
 from unittest.mock import patch
 
-import pytest
 
 # Pre-import tool module at collection time.
 # conftest.py (root) installs mcp/androguard stubs before this runs, and

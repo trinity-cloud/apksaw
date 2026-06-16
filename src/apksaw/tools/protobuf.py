@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import re
 import traceback
-from pathlib import Path
 
 from apksaw.server import mcp
 from apksaw.session import get_session
@@ -509,7 +508,6 @@ def _parse_grpc_path(path: str) -> tuple[str, str]:
     parts = path.lstrip("/").split("/", 1)
     if len(parts) == 2:
         svc_full, method = parts
-        svc_simple = svc_full.rsplit(".", 1)[-1]
         return svc_full, method
     return path, ""
 

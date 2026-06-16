@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-import pytest
 
 # Pre-import device tool functions at collection time
 from apksaw.tools.device import device_info, list_packages, screenshot

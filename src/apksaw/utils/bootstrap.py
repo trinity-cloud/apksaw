@@ -1,7 +1,6 @@
 """Bootstrap external tool dependencies."""
 
 import os
-import platform
 import stat
 import zipfile
 import urllib.request

@@ -1,6 +1,5 @@
 """Call graph visualization tools — Mermaid, DOT, and JSON export."""
 
-import json
 import re
 from collections import deque
 from pathlib import Path

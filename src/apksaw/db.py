@@ -16,8 +16,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from pathlib import Path
-from typing import Any, Generator, Optional
+from typing import Any, Generator
 
 from .config import DB_PATH, ensure_dirs
 

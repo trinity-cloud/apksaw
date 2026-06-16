@@ -12,8 +12,6 @@ is a stock (non-rooted) Pixel 10a, so frida-server cannot be pushed to
 
 import re
 import shutil
-import subprocess
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -954,39 +952,39 @@ def prepare_frida_apk(session_id: str, frida_script: str = "") -> dict:
                 '{\n'
                 '  "interaction": {\n'
                 '    "type": "script",\n'
-                f'    "path": "/data/local/tmp/frida_script.js"\n'
+                '    "path": "/data/local/tmp/frida_script.js"\n'
                 '  }\n'
                 '}'
             )
 
         commands = [
-            f"# Step 1 — Decompile",
+            "# Step 1 — Decompile",
             f"{apktool_cmd or 'apktool'} d -f -o {decompile_dir} {apk_path}",
             "",
-            f"# Step 2 — Copy gadget",
+            "# Step 2 — Copy gadget",
             f"mkdir -p {decompile_dir}/lib/arm64-v8a",
             f"cp {gadget_path or '/path/to/libfrida-gadget.so'} {gadget_dest}",
             "",
-            f"# Step 3 — Write gadget config",
+            "# Step 3 — Write gadget config",
             f"cat > {gadget_config} << 'GADGET_CONFIG'\n{gadget_config_json}\nGADGET_CONFIG",
             "",
             "# Step 4 — Patch smali (manual edit required — see step description above)",
             "",
-            f"# Step 5 — Rebuild",
+            "# Step 5 — Rebuild",
             f"{apktool_cmd or 'apktool'} b {decompile_dir} -o {recompiled_apk}",
             "",
-            f"# Step 6 — Zipalign",
+            "# Step 6 — Zipalign",
             f"{zipalign_path or 'zipalign'} -v 4 {recompiled_apk} {aligned_apk}",
             "",
-            f"# Step 7 — Create keystore (first time only)",
+            "# Step 7 — Create keystore (first time only)",
             f"keytool -genkey -v -keystore {keystore} -alias androiddebugkey "
             f"-keyalg RSA -keysize 2048 -validity 10000 "
             f"-storepass android -keypass android -dname 'CN=Android Debug,O=Android,C=US'",
-            f"# Step 7 — Sign",
+            "# Step 7 — Sign",
             f"{apksigner_path or 'apksigner'} sign --ks {keystore} "
             f"--ks-pass pass:android --key-pass pass:android --out {signed_apk} {aligned_apk}",
             "",
-            f"# Step 8 — Install (uninstall original first if same package)",
+            "# Step 8 — Install (uninstall original first if same package)",
             f"adb uninstall {package_name}",
             f"adb install {signed_apk}",
             "",

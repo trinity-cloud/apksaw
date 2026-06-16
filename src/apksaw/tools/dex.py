@@ -4,7 +4,6 @@ import asyncio
 import re
 import traceback
 from pathlib import Path
-from typing import Optional
 
 from apksaw.server import mcp
 from apksaw.session import get_session

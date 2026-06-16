@@ -408,7 +408,6 @@ def get_signing_info(session_id: str) -> dict:
 def _years_between(iso_start: str, iso_end: str) -> Optional[float]:
     """Return the approximate number of years between two ISO-8601 strings."""
     try:
-        fmt = "%Y-%m-%dT%H:%M:%S%z"
         # Attempt full ISO parse via fromisoformat (Python 3.11+ handles Z)
         try:
             start = datetime.fromisoformat(iso_start)

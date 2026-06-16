@@ -301,7 +301,7 @@ def _extract_method_sm(source: str, method_name: str, descriptor: str = "") -> s
 
     def _is_method_line(line: str) -> bool:
         stripped = line.strip()
-        if not (method_name + "(") in stripped:
+        if (method_name + "(") not in stripped:
             return False
         if stripped.startswith("//") or stripped.startswith("*"):
             return False

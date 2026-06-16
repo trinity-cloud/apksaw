@@ -863,7 +863,6 @@ def fuzz_content_providers(session_id: str, package_name: str) -> dict:
 
                     # Heuristic: if output contains rows or exception, mark accordingly
                     has_data  = bool(output) and "Row:" in output
-                    has_error = bool(error)
 
                     # Elevate result if we got actual data back (access succeeded)
                     if has_data and result_type == "no_crash":
