@@ -6,6 +6,7 @@
 |---|---|---|
 | Python | 3.10+ | 3.12 recommended |
 | ADB | any | Required for device tools only |
+| Java | 11+ | Required for JADX and apktool-backed workflows |
 | Android device or emulator | API 21+ | For live device interaction |
 
 ADB must be on your `PATH`:
@@ -88,7 +89,8 @@ Some features require additional system tools:
 | Native library disassembly | Capstone (installed automatically) |
 | ELF parsing | LIEF (installed automatically) |
 | Frida instrumentation | `frida-tools` (`pip install frida-tools`) |
-| APK repacking | `apktool` and `zipalign` in PATH |
+| Runtime Frida execution | `frida-tools` plus a matching `libfrida-gadget.so` under `~/.apksaw/tools/frida-gadget/` |
+| APK repacking | `apktool`, `zipalign`, and `apksigner` in PATH |
 
 ## Workspace storage
 
@@ -96,7 +98,7 @@ By default, apksaw stores session data and extracted APKs in:
 
 ```
 ~/.apksaw/workspaces/
-~/.apksaw/apksaw.db
+~/.apksaw/db/index.db
 ```
 
-Set `DROIDSCOPE_WORKSPACES_DIR` to override.
+Set `APKSAW_HOME` to override the base directory.

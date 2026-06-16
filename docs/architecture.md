@@ -33,7 +33,7 @@ load_apk("/path/to/app.apk")
 Sessions are stored in two places:
 
 1. **In-memory dict** (`_sessions`) — fast lookup, lost on process exit.
-2. **SQLite** (`~/.apksaw/apksaw.db`) — persists across restarts. On startup, `restore_sessions()` rehydrates the in-memory dict from the database.
+2. **SQLite** (`~/.apksaw/db/index.db`) — persists across restarts. On startup, `restore_sessions()` rehydrates the in-memory dict from the database.
 
 Androguard objects (`APK`, `DEX`, `Analysis`) are **lazy-loaded**: they are not parsed until a tool actually needs them, so `load_apk` is fast even for large APKs.
 
@@ -43,15 +43,30 @@ Each source file under `src/apksaw/tools/` registers a group of related tools:
 
 | Module | Tools |
 |---|---|
-| `device.py` | `device_info`, `list_packages`, `pull_apk`, `install_apk`, `uninstall_app`, `start_activity`, `send_broadcast`, `force_stop`, `clear_app_data`, `screenshot`, `monitor_logcat` |
-| `apk.py` | `load_apk`, `app_info`, `get_manifest`, `get_permissions`, `get_components`, `list_files`, `get_signing_info` |
-| `dex.py` | `list_classes`, `list_methods`, `get_class_info`, `decompile_class`, `decompile_method` |
-| `strings.py` | `search_strings`, `extract_urls`, `extract_interesting_strings` |
-| `xrefs.py` | `get_xrefs_to`, `get_xrefs_from`, `find_method_usage`, `get_call_graph`, `find_api_calls`, `search_code` |
-| `security.py` | `scan_all`, `scan_manifest_security`, `scan_network_security`, `scan_code_injection`, `scan_crypto_issues`, `scan_data_storage`, `extract_secrets` |
+| `device.py` | `device_info`, `list_packages`, `app_info`, `pull_apk`, `screenshot` |
+| `dynamic.py` | `monitor_logcat`, `start_activity`, `send_broadcast`, `get_runtime_info`, `force_stop`, `clear_app_data`, `install_apk`, `uninstall_app`, `take_screenshot`, `prepare_frida_apk` |
+| `runtime.py` | `repackage_with_gadget`, `run_frida_script`, `capture_runtime_secrets` |
+| `apk.py` | `load_apk`, `get_manifest`, `get_permissions`, `get_components`, `list_files` |
+| `dex.py` | `list_classes`, `get_class_info`, `list_methods`, `decompile_method`, `decompile_class`, `decompile_apk_full` |
+| `strings.py` | `search_strings`, `extract_urls`, `extract_secrets`, `search_code`, `extract_interesting_strings` |
+| `xrefs.py` | `get_xrefs_to`, `get_xrefs_from`, `get_call_graph`, `find_method_usage`, `find_api_calls` |
+| `security.py` | `scan_manifest_security`, `scan_crypto_issues`, `scan_network_security`, `scan_code_injection`, `scan_data_storage`, `scan_all` |
+| `security_v2.py` | `scan_crypto_issues_v2`, `scan_network_security_v2`, `scan_code_injection_v2`, `scan_all_v2` |
 | `certificates.py` | `get_signing_info`, `check_certificate_security` |
 | `native.py` | `list_native_libs`, `analyze_native_lib`, `search_native_strings`, `check_native_security`, `disassemble_function` |
-| `dynamic.py` | `get_runtime_info`, `prepare_frida_apk`, `take_screenshot` |
+| `diff.py` | `diff_apks`, `diff_manifest`, `diff_classes`, `diff_strings`, `diff_security` |
+| `patch_analysis.py` | `analyze_security_patches`, `find_patched_methods`, `find_vulnerability_window` |
+| `fuzzer.py` | `fuzz_exported_components`, `fuzz_deep_links`, `fuzz_content_providers` |
+| `fuzzer_v2.py` | `fuzz_exported_components_v2`, `fuzz_deep_links_v2`, `automine_blind_sqli` |
+| `exploit_gen.py` | `poc_old_version`, `generate_component_poc`, `generate_webview_exploit`, `generate_provider_poc`, `generate_deeplink_poc`, `generate_intent_redirection_poc` |
+| `frida_gen.py` | `generate_frida_hook`, `generate_ssl_bypass`, `generate_token_dumper`, `generate_crypto_hooks` |
+| `anti_analysis.py` | `detect_anti_analysis`, `generate_bypass_script` |
+| `endpoints.py` | `extract_api_endpoints`, `find_auth_interceptors` |
+| `protobuf.py` | `extract_protobuf_schemas`, `find_grpc_services`, `export_proto_file` |
+| `yara_scan.py` | `scan_yara`, `list_yara_rules` |
+| `mapping.py` | `load_mapping`, `deobfuscate_name`, `detect_obfuscation` |
+| `multidex.py` | `list_dex_files`, `analyze_dex_boundaries`, `get_dex_class_map` |
+| `visualization.py` | `export_call_graph` |
 
 Tools import `mcp` from `server.py` and use the `@mcp.tool()` decorator. The decorator reads the function's type hints and docstring to generate the MCP tool schema automatically.
 
@@ -64,6 +79,7 @@ Tools import `mcp` from `server.py` and use the `@mcp.tool()` decorator. The dec
 | [Capstone](https://www.capstone-engine.org/) | ARM/ARM64/x86 disassembly |
 | ADB | Live device interaction |
 | Frida | Dynamic instrumentation (optional) |
+| apktool / Android build tools | Gadget injection, APK repackaging, zipalign, and signing |
 
 ## Plugin System
 

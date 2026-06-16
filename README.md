@@ -5,7 +5,7 @@
 <p align="center">
   <h1 align="center">apksaw</h1>
   <p align="center"><strong>AI-agent Android reverse engineering toolkit</strong></p>
-  <p align="center">83 MCP tools. Plug into Claude Code and talk to APKs.</p>
+  <p align="center">97 MCP tools. Plug into Claude Code and talk to APKs.</p>
 </p>
 
 <p align="center">
@@ -17,11 +17,11 @@
 
 ---
 
-**apksaw** is an MCP server that gives AI agents the ability to reverse-engineer Android applications. It has 83 tools that fall into two categories:
+**apksaw** is an MCP server that gives AI agents the ability to reverse-engineer Android applications. It has 97 tools that fall into two categories:
 
 **Infrastructure tools** give the agent hands. An AI can't read binary DEX bytecode — apksaw translates APKs into decompiled Java, cross-reference graphs, parsed manifests, and structured data that the agent can reason about. The agent does the thinking; the tool provides the data.
 
-**Automation tools** do the work. The intent fuzzer generates 13 malformed payload variants per exported component, fires them via ADB, and monitors logcat for crashes — all in a single tool call. The security scanner checks for 50+ vulnerability patterns. The patch differ reverse-engineers what was fixed between two versions. These tools produce conclusions, not just raw data.
+**Automation tools** do the work. The intent fuzzer generates malformed payloads, fires them via ADB, and monitors logcat for crashes. The semantic fuzzer v2 derives app-specific grammars from bytecode and manifests. The runtime and PoC tools repackage apps with Frida gadget, capture live secrets, and replay exploit probes with logcat and screenshot evidence. These tools produce conclusions, not just raw data.
 
 > **apksaw is a force multiplier, not a replacement for security expertise.** In real-world testing, the automated scanner produced a 65% false positive rate. Every finding had to be verified by decompiling the surrounding code and tracing data flow. apksaw makes that verification fast. It doesn't make it unnecessary.
 
@@ -38,7 +38,7 @@ uv sync
 claude mcp add apksaw -- uv run --directory /path/to/apksaw apksaw
 ```
 
-Restart Claude Code. All 83 tools appear automatically.
+Restart Claude Code. All 97 tools appear automatically.
 
 ## What apksaw Does
 
@@ -51,6 +51,9 @@ These tools produce results, not just data. One tool call, structured output.
 | `fuzz_exported_components` | Tests every exported activity/receiver/service with malformed intents (SQLi, path traversal, XSS, null bytes, oversized strings). Monitors logcat for crashes and ANRs. |
 | `fuzz_deep_links` | 13 malformed URI variants per registered deep link scheme. Automated crash detection. |
 | `fuzz_content_providers` | SQL injection and path traversal against exported ContentProviders. Detects data exposure. |
+| `fuzz_exported_components_v2` | Builds payload suites from the extras each exported component actually reads via bytecode analysis. Dry-run by default, ADB execution behind `confirm=True`. |
+| `fuzz_deep_links_v2` | Builds URI suites from manifest `<data>` filters plus harvested `getQueryParameter` keys. |
+| `automine_blind_sqli` | Mines ContentProvider schemas and emits boolean, UNION, error, and SQLite time-oracle payloads using app-specific table/column names. |
 | `scan_all` | Runs 5 security scanners (manifest, crypto, network, injection, storage) and returns a combined severity report. |
 | `scan_all_v2` | Enhanced scanners with taint analysis — checks argument values, verifies TrustManager bodies, traces reachability from exported components. Adds confidence levels. |
 | `scan_yara` | 50 built-in YARA rules across 4 categories (credentials, crypto, obfuscation, suspicious behavior). |
@@ -58,10 +61,21 @@ These tools produce results, not just data. One tool call, structured output.
 | `extract_api_endpoints` | Finds REST URLs, Retrofit annotations, OkHttp base URLs. Maps the full API surface. |
 | `analyze_security_patches` | Compares two APK versions and identifies security-relevant fixes: unexported components, added pinning, removed dangerous APIs. |
 | `find_vulnerability_window` | Reverse-engineers what vulnerability was patched. Generates PoC commands for the old version. |
+| `poc_old_version` | Replays patch-diff PoCs against the old APK, optionally executing them on device with logcat and screenshot evidence. |
+| `generate_component_poc` | Generates and optionally runs exported activity/service/receiver probes with realistic extras. |
+| `generate_webview_exploit` | Builds JavaScript and Frida payloads for discovered `@JavascriptInterface` bridges. |
+| `generate_provider_poc` | Builds SQL injection and path traversal probes for exported ContentProviders. |
+| `generate_deeplink_poc` | Builds deep-link payload suites keyed to manifest filters and query-parameter usage. |
+| `generate_intent_redirection_poc` | Finds caller-controlled `startActivity` sinks and builds LaunchAnyWhere-style probes. |
+| `repackage_with_gadget` | Injects Frida gadget into an APK for non-rooted runtime analysis, with dry-run planning and explicit confirmation. |
+| `run_frida_script` | Attaches to a gadget-instrumented app and returns structured Frida message evidence. |
+| `capture_runtime_secrets` | One-call runtime capture for Bearer tokens, crypto keys, WebView bridges, and related secrets. |
 | `extract_protobuf_schemas` | Reconstructs `.proto` definitions from generated Java classes. Maps all gRPC services and RPC methods. |
 | `generate_ssl_bypass` | Analyzes the specific pinning implementation and generates a targeted Frida bypass script. |
 | `generate_token_dumper` | Finds auth interceptors in the APK and generates Frida hooks to capture Bearer tokens. |
 | `generate_crypto_hooks` | Generates Frida hooks for all Cipher, SecretKeySpec, and MessageDigest operations. |
+| `detect_anti_analysis` | Detects root, emulator, debugger, Frida, tamper, hook-detection, and SSL-pinning defenses with confidence tiers. |
+| `generate_bypass_script` | Generates targeted Frida bypass scripts for detected anti-analysis categories. |
 | `detect_obfuscation` | Analyzes class naming patterns to identify obfuscator (R8, ProGuard, DexGuard) and confidence level. |
 | `check_native_security` | Checks stack canary, NX, RELRO, PIE, Fortify on native `.so` libraries. |
 
@@ -82,19 +96,31 @@ These tools provide structured data that the agent interprets and reasons about.
 `get_xrefs_to` | `get_xrefs_from` | `get_call_graph` | `find_method_usage` | `find_api_calls` | `export_call_graph`
 
 **Diffing:**
-`diff_apks` | `diff_manifest` | `diff_classes` | `diff_strings` | `diff_security` | `find_patched_methods`
+`diff_apks` | `diff_manifest` | `diff_classes` | `diff_strings` | `diff_security` | `analyze_security_patches` | `find_patched_methods` | `find_vulnerability_window`
 
 **Native analysis:**
-`list_native_libs` | `analyze_native_lib` | `disassemble_function` | `search_native_strings`
+`list_native_libs` | `analyze_native_lib` | `disassemble_function` | `search_native_strings` | `check_native_security`
+
+**Runtime execution:**
+`repackage_with_gadget` | `run_frida_script` | `capture_runtime_secrets` | `prepare_frida_apk`
+
+**PoC execution:**
+`poc_old_version` | `generate_component_poc` | `generate_webview_exploit` | `generate_provider_poc` | `generate_deeplink_poc` | `generate_intent_redirection_poc`
+
+**Fuzzing:**
+`fuzz_exported_components` | `fuzz_deep_links` | `fuzz_content_providers` | `fuzz_exported_components_v2` | `fuzz_deep_links_v2` | `automine_blind_sqli`
+
+**Anti-analysis:**
+`detect_anti_analysis` | `generate_bypass_script`
 
 **Multi-DEX:**
 `list_dex_files` | `analyze_dex_boundaries` | `get_dex_class_map`
 
 **Mapping:**
-`load_mapping` | `deobfuscate_name`
+`load_mapping` | `deobfuscate_name` | `detect_obfuscation`
 
 **Other:**
-`find_grpc_services` | `export_proto_file` | `find_auth_interceptors` | `generate_frida_hook` | `prepare_frida_apk` | `list_yara_rules` | `list_plugins` | Individual scanners (`scan_manifest_security` | `scan_crypto_issues` | `scan_network_security` | `scan_code_injection` | `scan_data_storage` | `scan_crypto_issues_v2` | `scan_network_security_v2` | `scan_code_injection_v2`)
+`extract_protobuf_schemas` | `find_grpc_services` | `export_proto_file` | `extract_api_endpoints` | `find_auth_interceptors` | `generate_frida_hook` | `generate_ssl_bypass` | `generate_token_dumper` | `generate_crypto_hooks` | `scan_yara` | `list_yara_rules` | `list_plugins` | Individual scanners (`scan_manifest_security` | `scan_crypto_issues` | `scan_network_security` | `scan_code_injection` | `scan_data_storage` | `scan_crypto_issues_v2` | `scan_network_security_v2` | `scan_code_injection_v2` | `scan_all_v2`)
 
 ## How It Works
 
@@ -113,6 +139,8 @@ apksaw MCP Server (stdio)
   +--> Capstone --------> ARM/ARM64 disassembly
   +--> YARA ------------> Pattern-based detection
   +--> ADB -------------> Device interaction, APK extraction
+  +--> apktool/apksigner> Gadget injection and repackaging
+  +--> Frida -----------> Runtime hooks and evidence capture
 ```
 
 ## Examples
@@ -127,6 +155,12 @@ apksaw MCP Server (stdio)
 ```
 > Fuzz all exported components of com.example.app with malformed intents.
   If anything crashes, decompile the crashing component and find the bug.
+```
+
+### Capture runtime secrets on a non-rooted device
+```
+> Repackage this APK with Frida gadget, install it on my test device,
+  then capture Bearer tokens and crypto keys during login.
 ```
 
 ### Hunt for zero-days via patch diffing
@@ -145,6 +179,12 @@ apksaw MCP Server (stdio)
 ```
 > Analyze how this app does SSL pinning, then generate a Frida script
   that bypasses it. Also generate hooks for all crypto operations.
+```
+
+### Probe hardened apps
+```
+> Detect anti-analysis checks in this APK and generate a bypass script
+  I can run through the runtime tools.
 ```
 
 ## Case Studies
@@ -182,6 +222,10 @@ src/apksaw/
     diff.py              # APK version comparison
     patch_analysis.py    # Security patch reverse-engineering
     fuzzer.py            # Intent fuzzing with crash detection
+    fuzzer_v2.py         # App-aware semantic fuzzing and blind SQLi automining
+    exploit_gen.py       # PoC generation and live evidence capture
+    runtime.py           # Frida gadget repackaging and runtime secret capture
+    anti_analysis.py     # Anti-analysis detection and bypass script generation
     frida_gen.py         # Frida script generation
     endpoints.py         # API endpoint discovery
     protobuf.py          # Protobuf/gRPC schema extraction
@@ -207,7 +251,9 @@ src/apksaw/
 - Python 3.10+
 - ADB installed and on `$PATH`
 - Java 11+ (for JADX/apktool)
+- Android build tools (`zipalign`, `apksigner`) for runtime gadget repackaging
 - A connected Android device or an APK file
+- Frida Python packages and `libfrida-gadget.so` for runtime execution
 
 JADX and apktool are **downloaded automatically** on first use to `~/.apksaw/tools/`.
 
