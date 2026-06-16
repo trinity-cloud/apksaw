@@ -176,6 +176,78 @@ def get_const_string_at_callsite(
         return None
 
 
+def get_const_int_at_callsite(
+    analysis,
+    method_analysis,
+    invoke_offset: int,
+    arg_index: int,
+) -> int | None:
+    """Walk backwards from an invoke instruction to find the integer/boolean
+    constant that feeds the argument at *arg_index*.
+
+    This is the primitive-valued counterpart to
+    :func:`get_const_string_at_callsite`.  It resolves ``const/4``,
+    ``const/16``, ``const``, and the wide variants, following one level of
+    ``move`` indirection.  Booleans are represented as ``0`` (false) / ``1``
+    (true) in Dalvik, so this also resolves boolean arguments such as the one
+    passed to ``WebSettings.setAllowUniversalAccessFromFileURLs(boolean)``.
+
+    Conservative by design: anything it cannot prove to be a literal returns
+    ``None`` (caller should treat that as "unresolved", not "safe").
+    ``const/high16`` is deliberately *not* resolved because Androguard renders
+    its operand pre-shift, which would yield a wrong value — booleans and small
+    mode flags never use ``high16`` so nothing of interest is lost.
+
+    Args:
+        analysis: Androguard ``Analysis`` object.
+        method_analysis: ``MethodAnalysis`` for the *caller* method.
+        invoke_offset: Byte offset of the invoke instruction.
+        arg_index: Zero-based argument index. For instance methods index 0 is
+            ``this``; for a one-arg setter the value is at index 1.
+
+    Returns:
+        The integer value if it can be resolved, otherwise ``None``.
+    """
+    try:
+        method = method_analysis.get_method()
+        if method is None:
+            return None
+
+        instructions = list(method.get_instructions())
+        if not instructions:
+            return None
+
+        offset_map: dict[int, tuple[int, object]] = {}
+        current_offset = 0
+        invoke_idx: int | None = None
+
+        for idx, instr in enumerate(instructions):
+            offset_map[current_offset] = (idx, instr)
+            if current_offset == invoke_offset:
+                invoke_idx = idx
+            current_offset += instr.get_length()
+
+        if invoke_idx is None:
+            for offset, (idx, instr) in offset_map.items():
+                if abs(offset - invoke_offset) <= 8 and "invoke" in instr.get_name():
+                    invoke_idx = idx
+                    break
+
+        if invoke_idx is None:
+            return None
+
+        invoke_instr = instructions[invoke_idx]
+        target_reg = _get_invoke_arg_register(invoke_instr, arg_index)
+        if target_reg is None:
+            return None
+
+        return _trace_int_register_backward(instructions, invoke_idx - 1, target_reg)
+
+    except Exception as exc:
+        logger.debug("get_const_int_at_callsite failed: %s", exc)
+        return None
+
+
 def resolve_constant_interprocedural(
     analysis,
     method_analysis,
@@ -1497,5 +1569,62 @@ def _extract_const_string_value(output: str) -> str | None:
            (val.startswith('"') and val.endswith('"')):
             val = val[1:-1]
         return val if val else None
+    except (ValueError, IndexError):
+        return None
+
+
+def _trace_int_register_backward(instructions, start_idx: int, target_reg: str) -> int | None:
+    """Walk backwards from *start_idx* to find an integer ``const*`` that last
+    wrote to *target_reg*.  Follows one level of ``move`` indirection.
+
+    Returns the integer value or ``None``.  ``const/high16`` is intentionally
+    not handled (see :func:`get_const_int_at_callsite`).
+    """
+    current_reg = target_reg
+    for idx in range(start_idx, -1, -1):
+        instr = instructions[idx]
+        mnemonic = instr.get_name()
+        output = instr.get_output()
+
+        dest_reg = _get_dest_register(output)
+        if dest_reg != current_reg:
+            continue
+
+        if mnemonic in ("const/4", "const/16", "const",
+                        "const-wide", "const-wide/16", "const-wide/32"):
+            return _extract_const_int_value(output)
+
+        if mnemonic in ("move", "move/from16", "move/16",
+                        "move-wide", "move-wide/from16", "move-wide/16"):
+            src = _get_move_source(output)
+            if src:
+                current_reg = src
+            continue
+
+        if mnemonic in ("move-result", "move-result-wide"):
+            # Value came from a call — not a static constant.
+            return None
+
+        # Any other instruction writing to current_reg terminates the trace.
+        return None
+
+    return None
+
+
+def _extract_const_int_value(output: str) -> int | None:
+    """Extract the integer literal from a ``const*`` instruction output.
+
+    Androguard formats these as ``v0, 0x1`` (hex) or occasionally ``v0, 1``
+    (decimal).  Returns the parsed integer, or ``None`` if it cannot be parsed.
+    """
+    try:
+        comma_idx = output.index(",")
+        val = output[comma_idx + 1:].strip()
+        # Keep only the first token (drop any trailing comment/annotation).
+        val = val.split()[0].strip().rstrip(",")
+        lowered = val.lower()
+        if lowered.startswith("0x") or lowered.startswith("-0x"):
+            return int(val, 16)
+        return int(val, 10)
     except (ValueError, IndexError):
         return None

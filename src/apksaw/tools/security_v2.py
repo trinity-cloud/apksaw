@@ -33,6 +33,7 @@ from apksaw.session import get_session
 from apksaw.utils.taint_lite import (
     check_empty_method_body,
     get_arg_source_type,
+    get_const_int_at_callsite,
     get_const_string_at_callsite,
     is_reachable_from_exported,
 )
@@ -77,8 +78,19 @@ def _finding_v2(
     confidence: str = "medium",
     reachable_from_exported: bool = False,
     details: str = "",
+    verify_with: str = "",
+    verification_needed: bool | None = None,
 ) -> dict:
-    """Construct a normalised v2 finding dict with extra analysis fields."""
+    """Construct a normalised v2 finding dict with extra analysis fields.
+
+    ``verification_needed`` defaults to ``True`` for any finding that is not
+    high-confidence — i.e. anything the scanner could not prove statically. The
+    agent driving these tools should confirm such findings against the
+    decompiled code before reporting them to the user; ``verify_with`` gives the
+    concrete recipe for doing so.
+    """
+    if verification_needed is None:
+        verification_needed = confidence != "high"
     return {
         "severity": severity,
         "category": category,
@@ -89,6 +101,8 @@ def _finding_v2(
         "confidence": confidence,
         "reachable_from_exported": reachable_from_exported,
         "details": details,
+        "verification_needed": verification_needed,
+        "verify_with": verify_with,
     }
 
 
@@ -148,7 +162,6 @@ def scan_crypto_issues_v2(session_id: str) -> dict:
     """
     try:
         session = get_session(session_id)
-        apk = session.apk
         analysis = session.analysis
         findings: list[dict] = []
 
@@ -536,6 +549,11 @@ def scan_crypto_issues_v2(session_id: str) -> dict:
                     f"{len(non_empty_tm)} class(es) have non-empty checkServerTrusted. "
                     "Downgraded from critical — manual review needed."
                 ),
+                verify_with=(
+                    "decompile_class on each listed class and read checkServerTrusted(): "
+                    "a body that catches-and-ignores CertificateException, or returns "
+                    "without ever throwing, is a real MITM bug despite being non-empty."
+                ),
             ))
 
         return {
@@ -586,7 +604,6 @@ def scan_network_security_v2(session_id: str) -> dict:
     """
     try:
         session = get_session(session_id)
-        apk = session.apk
         analysis = session.analysis
         findings: list[dict] = []
 
@@ -683,6 +700,11 @@ def scan_network_security_v2(session_id: str) -> dict:
                     f"{len(non_empty_tm)} class(es) have non-empty checkServerTrusted. "
                     "Downgraded from critical — manual audit required."
                 ),
+                verify_with=(
+                    "decompile_class on each listed class and read checkServerTrusted(): "
+                    "a try/catch that swallows the exception, or any path that returns "
+                    "without throwing on a bad cert, is a real MITM bug."
+                ),
             ))
 
         # --------------------------------------------------------------- #
@@ -755,35 +777,74 @@ def scan_network_security_v2(session_id: str) -> dict:
                 details=(
                     f"{len(custom_hn)} class(es) with non-trivial verify() body."
                 ),
+                verify_with=(
+                    "decompile_class on each listed class and read verify(): confirm it "
+                    "compares the hostname against the certificate (not a permissive regex "
+                    "or an unconditional return true)."
+                ),
             ))
 
         # --------------------------------------------------------------- #
-        # WebView setMixedContentMode
+        # WebView setMixedContentMode — resolve the int mode argument
         # --------------------------------------------------------------- #
-        mixed_callers = _callers_with_method_analysis(
-            analysis,
-            r"Landroid/webkit/WebSettings;",
-            r"setMixedContentMode",
-            limit=20,
-        )
-        if mixed_callers:
-            locs = [loc for loc, _ in mixed_callers]
+        mixed_always_allow: list[str] = []   # mode 0 = MIXED_CONTENT_ALWAYS_ALLOW
+        mixed_unknown: list[str] = []
+        for target_ma in analysis.find_methods(
+            classname=r"Landroid/webkit/WebSettings;",
+            methodname=r"setMixedContentMode",
+        ):
+            for _, caller_ma, call_offset in target_ma.get_xref_from():
+                loc = f"{caller_ma.class_name}->{caller_ma.name}"
+                mode = get_const_int_at_callsite(
+                    analysis, caller_ma, call_offset, arg_index=1
+                )
+                if mode == 0:
+                    if loc not in mixed_always_allow:
+                        mixed_always_allow.append(loc)
+                elif mode in (1, 2):
+                    continue  # NEVER_ALLOW / COMPATIBILITY_MODE — safe, not reported
+                else:
+                    if loc not in mixed_unknown:
+                        mixed_unknown.append(loc)
+
+        if mixed_always_allow:
             findings.append(_finding_v2(
                 severity="high",
                 category="network",
-                title="WebView setMixedContentMode called (verify not ALWAYS_ALLOW)",
+                title="WebView setMixedContentMode(MIXED_CONTENT_ALWAYS_ALLOW) (confirmed)",
                 description=(
-                    "setMixedContentMode() is called. MIXED_CONTENT_ALWAYS_ALLOW (0) "
-                    "permits HTTP subresources in HTTPS pages, enabling content injection."
+                    "setMixedContentMode() is called with MIXED_CONTENT_ALWAYS_ALLOW (0), "
+                    "permitting HTTP subresources inside HTTPS pages — enabling content "
+                    "injection / MITM of WebView content."
                 ),
-                location="; ".join(locs[:5]),
+                location="; ".join(mixed_always_allow[:5]),
                 recommendation=(
-                    "Use MIXED_CONTENT_NEVER_ALLOW (1) or MIXED_CONTENT_COMPATIBILITY_MODE (2)."
+                    "Use MIXED_CONTENT_NEVER_ALLOW (1); use COMPATIBILITY_MODE (2) only "
+                    "if strictly required."
+                ),
+                confidence="high",
+                details="Mode argument resolved to 0 (ALWAYS_ALLOW) by static trace.",
+            ))
+
+        if mixed_unknown:
+            findings.append(_finding_v2(
+                severity="medium",
+                category="network",
+                title="WebView setMixedContentMode called (mode not resolved)",
+                description=(
+                    "setMixedContentMode() is called but the mode argument could not be "
+                    "resolved statically. If it is MIXED_CONTENT_ALWAYS_ALLOW (0), HTTP "
+                    "subresources are permitted in HTTPS pages."
+                ),
+                location="; ".join(mixed_unknown[:5]),
+                recommendation=(
+                    "Use MIXED_CONTENT_NEVER_ALLOW (1) or COMPATIBILITY_MODE (2)."
                 ),
                 confidence="low",
-                details=(
-                    "Constant value passed was not resolved — requires manual inspection "
-                    "to confirm ALWAYS_ALLOW is not used."
+                details="Mode argument was not a resolvable constant at the call-site.",
+                verify_with=(
+                    "decompile_class on each listed class and read the int argument passed "
+                    "to setMixedContentMode; confirm it is not 0 (ALWAYS_ALLOW)."
                 ),
             ))
 
@@ -826,34 +887,70 @@ def scan_network_security_v2(session_id: str) -> dict:
             ))
 
         # --------------------------------------------------------------- #
-        # WebView setAllowUniversalAccessFromFileURLs
+        # WebView setAllowUniversalAccessFromFileURLs — resolve boolean arg
         # --------------------------------------------------------------- #
-        universal_callers = _callers_with_method_analysis(
-            analysis,
-            r"Landroid/webkit/WebSettings;",
-            r"setAllowUniversalAccessFromFileURLs",
-            limit=20,
-        )
-        if universal_callers:
-            locs = [loc for loc, _ in universal_callers]
+        # This is the canonical pattern-scanner false positive: flagging the
+        # call as critical without reading the boolean. Call-sites that pass
+        # false (the safe default) are dropped entirely; only true is reported.
+        uafu_true: list[str] = []
+        uafu_unknown: list[str] = []
+        for target_ma in analysis.find_methods(
+            classname=r"Landroid/webkit/WebSettings;",
+            methodname=r"setAllowUniversalAccessFromFileURLs",
+        ):
+            for _, caller_ma, call_offset in target_ma.get_xref_from():
+                loc = f"{caller_ma.class_name}->{caller_ma.name}"
+                val = get_const_int_at_callsite(
+                    analysis, caller_ma, call_offset, arg_index=1
+                )
+                if val == 1:
+                    if loc not in uafu_true:
+                        uafu_true.append(loc)
+                elif val == 0:
+                    continue  # explicit false — the safe default, not reported
+                else:
+                    if loc not in uafu_unknown:
+                        uafu_unknown.append(loc)
+
+        if uafu_true:
             findings.append(_finding_v2(
                 severity="high",
                 category="network",
-                title="WebView setAllowUniversalAccessFromFileURLs called",
+                title="WebView setAllowUniversalAccessFromFileURLs(true) (confirmed)",
                 description=(
-                    "If set to true, JavaScript in file:// pages can make cross-origin "
+                    "Called with true: JavaScript in file:// pages can make cross-origin "
                     "requests to any origin, enabling data theft if the WebView loads "
                     "attacker-controlled HTML."
                 ),
-                location="; ".join(locs[:5]),
+                location="; ".join(uafu_true[:5]),
                 recommendation=(
                     "Set setAllowUniversalAccessFromFileURLs(false) (the default). "
                     "Avoid loading local files in WebViews."
                 ),
-                confidence="medium",
+                confidence="high",
+                details="Boolean argument resolved to TRUE by static trace.",
+            ))
+
+        if uafu_unknown:
+            findings.append(_finding_v2(
+                severity="medium",
+                category="network",
+                title="WebView setAllowUniversalAccessFromFileURLs called (value not resolved)",
+                description=(
+                    "setAllowUniversalAccessFromFileURLs() is called but the boolean "
+                    "argument could not be resolved statically. If true, file:// pages "
+                    "gain cross-origin access."
+                ),
+                location="; ".join(uafu_unknown[:5]),
+                recommendation="Ensure false is passed (the default), or remove the call.",
+                confidence="low",
                 details=(
-                    "Boolean argument value was not resolved — verify false is passed. "
-                    f"{len(locs)} call-site(s)."
+                    f"{len(uafu_unknown)} call-site(s) with an unresolved boolean argument. "
+                    "Call-sites resolved to false were filtered out."
+                ),
+                verify_with=(
+                    "decompile_class on each listed class and read the boolean argument "
+                    "passed to setAllowUniversalAccessFromFileURLs; confirm it is false (0)."
                 ),
             ))
 
@@ -971,6 +1068,12 @@ def scan_code_injection_v2(session_id: str) -> dict:
                         f"{len(unreachable_locs)} call-site(s) found but no path from "
                         "an exported entry point was detected (BFS depth 10). "
                         "Reachability may exist through reflection or dynamic dispatch."
+                    ),
+                    verify_with=(
+                        "decompile the listed method(s) and check whether the dangerous "
+                        "argument is attacker-controllable; use get_xrefs_to to see if any "
+                        "reflective or dynamic-dispatch path reaches it from an exported "
+                        "component."
                     ),
                 ))
 
@@ -1158,16 +1261,27 @@ def scan_code_injection_v2(session_id: str) -> dict:
 def scan_all_v2(session_id: str) -> dict:
     """Run all v2 security scanners and return a combined report.
 
-    Executes ``scan_crypto_issues_v2``, ``scan_network_security_v2``, and
-    ``scan_code_injection_v2``, then aggregates all findings with a
-    combined severity summary broken down by confidence level.
+    This is the recommended entry point for a security scan. It executes
+    ``scan_crypto_issues_v2``, ``scan_network_security_v2``, and
+    ``scan_code_injection_v2``, then aggregates all findings with a combined
+    severity summary broken down by confidence level.
+
+    IMPORTANT — these are candidates, not a finished assessment. Static scanners
+    have a high false-positive rate. Every finding carries ``confidence`` and,
+    when not high-confidence, ``verification_needed=true`` plus a ``verify_with``
+    recipe. Before presenting results to the user you should work through the
+    findings flagged for verification: decompile the cited class/method, confirm
+    the condition actually holds, and only then report it as a real bug.
+    High-confidence findings have already had their arguments/bodies resolved
+    statically and can be reported directly.
 
     Args:
         session_id: Session ID returned by load_apk.
 
     Returns:
         A dict with status and data containing all findings, per-scanner
-        results, a combined severity summary, and a confidence breakdown.
+        results, a combined severity summary, a confidence breakdown, and a
+        ``needs_verification_count``.
     """
     scanners = {
         "crypto_v2": scan_crypto_issues_v2,
@@ -1202,6 +1316,10 @@ def scan_all_v2(session_id: str) -> dict:
         1 for f in all_findings if f.get("reachable_from_exported", False)
     )
 
+    # Verification summary — how many findings the scanner could not prove on
+    # its own and that the agent should confirm before reporting to the user.
+    needs_verification = [f for f in all_findings if f.get("verification_needed")]
+
     return {
         "status": "ok" if not errors else "partial",
         "data": {
@@ -1209,7 +1327,16 @@ def scan_all_v2(session_id: str) -> dict:
             "summary": _make_summary(all_findings),
             "confidence_breakdown": confidence_summary,
             "reachable_from_exported_count": reachable_count,
+            "needs_verification_count": len(needs_verification),
             "total_findings": len(all_findings),
+            "guidance": (
+                "Findings with verification_needed=true are candidates, not "
+                "confirmed bugs. Before reporting them to the user, follow each "
+                "finding's verify_with recipe (decompile the cited class/method "
+                "and confirm the condition holds). Report high-confidence "
+                "findings as confirmed; present unverified low-confidence ones "
+                "as leads to investigate, not vulnerabilities."
+            ),
             "per_scanner": {
                 name: r.get("data", {}).get("summary", {})
                 for name, r in per_scanner.items()

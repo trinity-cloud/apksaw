@@ -1,6 +1,6 @@
 """String extraction and search tools for Android APK analysis."""
 
-import base64
+import math
 import re
 from typing import Iterator
 
@@ -78,10 +78,16 @@ _RE_DOMAIN_LIKE = re.compile(
     re.IGNORECASE,
 )
 
-_SECRETS_PATTERNS: list[tuple[str, str, str, re.Pattern]] = [
-    # (pattern_name, severity, description, compiled_re)
+# (pattern_name, severity, confidence, description, compiled_re)
+# ``confidence`` reflects how strongly the pattern alone implies a real secret:
+#   high   — a definitive, well-known key format (Google/AWS/PEM) or a fixed
+#            vendor domain. Format match is near-conclusive for the *type*.
+#   medium — context/assignment heuristics that frequently match placeholders,
+#            test values, or examples and therefore need confirmation.
+_SECRETS_PATTERNS: list[tuple[str, str, str, str, re.Pattern]] = [
     (
         "google_api_key",
+        "high",
         "high",
         "Google API Key",
         re.compile(r"AIza[0-9A-Za-z\-_]{35}"),
@@ -89,17 +95,20 @@ _SECRETS_PATTERNS: list[tuple[str, str, str, re.Pattern]] = [
     (
         "aws_access_key",
         "high",
+        "high",
         "AWS Access Key ID",
         re.compile(r"AKIA[0-9A-Z]{16}"),
     ),
     (
         "aws_secret_context",
         "high",
+        "medium",
         "AWS Secret Key context",
         re.compile(r"(?:aws_secret|secret_key)\s*[=:]\s*['\"]?([A-Za-z0-9/+]{20,})['\"]?", re.IGNORECASE),
     ),
     (
         "generic_api_key",
+        "medium",
         "medium",
         "Generic API Key assignment",
         re.compile(r"[Aa]pi[_\-]?[Kk]ey\s*[=:]\s*['\"]([A-Za-z0-9]{16,})['\"]"),
@@ -107,17 +116,20 @@ _SECRETS_PATTERNS: list[tuple[str, str, str, re.Pattern]] = [
     (
         "firebase_url",
         "medium",
+        "high",
         "Firebase Realtime Database URL",
         re.compile(r"[a-z0-9\-]+\.firebaseio\.com", re.IGNORECASE),
     ),
     (
         "private_key_pem",
         "high",
+        "high",
         "PEM Private Key block",
         re.compile(r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----"),
     ),
     (
         "password_context",
+        "medium",
         "medium",
         "Hardcoded password value",
         re.compile(
@@ -128,12 +140,50 @@ _SECRETS_PATTERNS: list[tuple[str, str, str, re.Pattern]] = [
     (
         "bearer_token",
         "high",
+        "medium",
         "Bearer token",
         re.compile(r"Bearer [A-Za-z0-9\-._~+/]+=*"),
     ),
+    (
+        "slack_token",
+        "high",
+        "high",
+        "Slack token",
+        re.compile(r"xox[baprs]-[0-9A-Za-z\-]{10,}"),
+    ),
+    (
+        "stripe_secret_key",
+        "high",
+        "high",
+        "Stripe secret key",
+        re.compile(r"sk_live_[0-9A-Za-z]{16,}"),
+    ),
+    (
+        "github_token",
+        "high",
+        "high",
+        "GitHub personal access token",
+        re.compile(r"gh[pousr]_[0-9A-Za-z]{36,}"),
+    ),
+    (
+        "jwt",
+        "medium",
+        "high",
+        "JSON Web Token",
+        re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),
+    ),
 ]
 
-_RE_HIGH_ENTROPY_B64 = re.compile(r"^[A-Za-z0-9+/]{20,}={0,2}$")
+_RE_HIGH_ENTROPY_B64 = re.compile(r"^[A-Za-z0-9+/]{24,}={0,2}$")
+
+# A token that looks like a Java/Kotlin identifier, class path, descriptor, or
+# crypto-transformation string rather than a real secret. These dominate the
+# DEX string pool and were the source of thousands of false-positive
+# "high entropy" hits in real audits (e.g. ``ActivityResultRegistry``,
+# ``AES/CBC/PKCS7Padding``).
+_RE_IDENTIFIER_LIKE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9]*(?:[/_$.][A-Za-z][A-Za-z0-9]*)*$"
+)
 
 # Interesting-string category patterns
 _RE_FILE_PATH = re.compile(r"(?:/[\w.\-]+){2,}|[\w\-]+\.(?:apk|dex|so|jar|sh|db|sqlite|json|xml|pem|key|crt|p12|pfx)")
@@ -173,19 +223,61 @@ def _iter_strings(session_id: str):
     return session.analysis.get_strings()
 
 
+def _shannon_entropy(value: str) -> float:
+    """Return the Shannon entropy of *value* in bits per character."""
+    if not value:
+        return 0.0
+    counts: dict[str, int] = {}
+    for ch in value:
+        counts[ch] = counts.get(ch, 0) + 1
+    n = len(value)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def _looks_like_identifier(value: str) -> bool:
+    """True if *value* resembles a class path / identifier / constant name.
+
+    These (e.g. ``ActivityResultRegistry``, ``AES/CBC/PKCS7Padding``) match a
+    loose base64 character set but are not secrets. Filtering them removes the
+    dominant false-positive class in the DEX string pool.
+    """
+    return bool(_RE_IDENTIFIER_LIKE.match(value))
+
+
 def _is_high_entropy_b64(value: str) -> bool:
-    """Return True if value looks like a high-entropy base64 secret."""
-    if len(value) < 20:
+    """Return True if *value* looks like genuinely high-entropy secret material.
+
+    Tightened well beyond a charset+length check to suppress the dominant
+    false-positive class (Java identifiers, class descriptors, crypto
+    transformation strings). A candidate must:
+
+    - be at least 24 chars of the base64 alphabet;
+    - NOT parse as an identifier / class path / transformation string;
+    - show character-class diversity typical of real keys (a mix of
+      upper/lower/digit, or base64 symbols ``+`` ``/`` ``=``);
+    - have Shannon entropy above ~3.6 bits/char (random key material sits
+      well above this; English-ish identifiers sit below).
+    """
+    if len(value) < 24:
         return False
     if not _RE_HIGH_ENTROPY_B64.match(value):
         return False
-    try:
-        decoded = base64.b64decode(value + "==")  # pad just in case
-        # Crude entropy check: ratio of unique bytes should be > 0.5
-        unique_ratio = len(set(decoded)) / max(len(decoded), 1)
-        return unique_ratio > 0.4
-    except Exception:  # noqa: BLE001
+
+    entropy = _shannon_entropy(value)
+    # Identifier / class-path / transformation strings are rejected — unless the
+    # entropy is so high the value cannot be a readable identifier (real keys
+    # that happen to be '/'-separated, e.g. AWS secret keys, sit well above this).
+    if _looks_like_identifier(value) and entropy < 4.2:
         return False
+
+    has_lower = any(c.islower() for c in value)
+    has_upper = any(c.isupper() for c in value)
+    has_digit = any(c.isdigit() for c in value)
+    has_symbol = ("+" in value) or ("/" in value) or value.endswith("=")
+    if sum((has_lower, has_upper, has_digit)) < 2 and not has_symbol:
+        return False
+
+    return entropy >= 3.6
 
 
 # ---------------------------------------------------------------------------
@@ -353,24 +445,27 @@ def extract_secrets(session_id: str) -> dict:
     Scans the DEX string pool against a curated list of patterns that
     commonly indicate secrets embedded in APK code:
 
-    - Google API keys (``AIza…``)
-    - AWS access / secret keys
-    - Generic API key assignments
-    - Firebase Realtime Database URLs
-    - PEM private key blocks
-    - Hardcoded password assignments
-    - Bearer tokens
-    - High-entropy base64 blobs (> 20 chars)
+    - Google API keys (``AIza…``), AWS access/secret keys, PEM private keys
+    - Slack / Stripe / GitHub tokens, JWTs, Firebase Realtime Database URLs
+    - Generic API-key and password assignments, Bearer tokens
+    - High-entropy blobs (entropy + diversity filtered, identifiers excluded)
 
-    Each finding records the matched value, the pattern name, a severity
-    (``high`` / ``medium`` / ``low``), and which methods reference the string.
+    Each finding records the matched value, the pattern name, a severity, a
+    ``confidence`` level, a ``verification_needed`` flag, a ``verify_with``
+    recipe, and which methods reference the string.
+
+    IMPORTANT — finding a string that *looks* like a key is not the same as
+    finding an exploitable secret. The high-entropy detector in particular is
+    noisy; treat anything with ``verification_needed=true`` as a candidate and
+    confirm it via ``verify_with`` before reporting it to the user.
 
     Args:
         session_id: Active analysis session ID.
 
     Returns:
         dict: ``{"status": "ok", "data": {"findings": [...], "total": N,
-                 "severity_counts": {"high": N, "medium": N, "low": N}}}``
+                 "severity_counts": {...}, "confidence_counts": {...},
+                 "needs_verification_count": N, "guidance": "..."}}``
     """
     try:
         session = get_session(session_id)
@@ -384,7 +479,7 @@ def extract_secrets(session_id: str) -> dict:
             methods = _xref_methods(sa)
 
             # Check each named pattern
-            for pattern_name, severity, description, compiled_re in _SECRETS_PATTERNS:
+            for pattern_name, severity, confidence, description, compiled_re in _SECRETS_PATTERNS:
                 if compiled_re.search(value):
                     key = f"{pattern_name}:{value}"
                     if key not in seen:
@@ -395,11 +490,22 @@ def extract_secrets(session_id: str) -> dict:
                                 "pattern_name": pattern_name,
                                 "description": description,
                                 "severity": severity,
+                                "confidence": confidence,
+                                "verification_needed": confidence != "high",
+                                "verify_with": (
+                                    "Decompile a referencing method and confirm this is a "
+                                    "live credential, not a placeholder, example, or test "
+                                    "value. For API keys, check whether the key is scoped/"
+                                    "restricted before treating it as exploitable."
+                                ),
                                 "methods": methods,
                             }
                         )
 
-            # High-entropy base64 check (only if nothing else matched)
+            # High-entropy blob check (only if nothing else matched). This is the
+            # noisiest detector by far, so it is always low-confidence and must be
+            # verified — the value is just as likely to be encoded data, a hash,
+            # or an obfuscated identifier as a real secret.
             b64_key = f"high_entropy_b64:{value}"
             if b64_key not in seen and _is_high_entropy_b64(value):
                 seen.add(b64_key)
@@ -407,8 +513,15 @@ def extract_secrets(session_id: str) -> dict:
                     {
                         "value": value,
                         "pattern_name": "high_entropy_b64",
-                        "description": "High-entropy base64-encoded string (possible secret)",
+                        "description": "High-entropy string (possible secret — unconfirmed)",
                         "severity": "low",
+                        "confidence": "low",
+                        "verification_needed": True,
+                        "verify_with": (
+                            "Decompile a referencing method and determine what this string "
+                            "is. High entropy alone does not make it a secret — it may be "
+                            "encoded data, a hash, a resource id, or an obfuscated name."
+                        ),
                         "methods": methods,
                     }
                 )
@@ -418,8 +531,12 @@ def extract_secrets(session_id: str) -> dict:
         findings.sort(key=lambda f: (_sev_order.get(f["severity"], 99), f["pattern_name"]))
 
         severity_counts: dict[str, int] = {"high": 0, "medium": 0, "low": 0}
+        confidence_counts: dict[str, int] = {"high": 0, "medium": 0, "low": 0}
         for f in findings:
             severity_counts[f["severity"]] = severity_counts.get(f["severity"], 0) + 1
+            confidence_counts[f["confidence"]] = confidence_counts.get(f["confidence"], 0) + 1
+
+        needs_verification = sum(1 for f in findings if f.get("verification_needed"))
 
         return {
             "status": "ok",
@@ -427,6 +544,16 @@ def extract_secrets(session_id: str) -> dict:
                 "findings": findings,
                 "total": len(findings),
                 "severity_counts": severity_counts,
+                "confidence_counts": confidence_counts,
+                "needs_verification_count": needs_verification,
+                "guidance": (
+                    "Format-validated high-confidence hits (Google/AWS/PEM/Slack/"
+                    "Stripe/GitHub/Firebase) are very likely real keys of that type, "
+                    "but still confirm they are live and unrestricted before "
+                    "reporting impact. Everything with verification_needed=true — "
+                    "especially high_entropy_b64 — is a candidate: follow verify_with "
+                    "before presenting it to the user as a secret."
+                ),
             },
         }
 

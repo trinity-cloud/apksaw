@@ -1304,8 +1304,18 @@ def scan_data_storage(session_id: str) -> dict:
 def scan_all(session_id: str) -> dict:
     """Run all security scans and return a combined report.
 
-    Executes scan_manifest_security, scan_crypto_issues, scan_network_security,
-    scan_code_injection, and scan_data_storage, then aggregates findings.
+    Uses the verified **v2** scanners for crypto, network, and code injection —
+    these inspect actual argument values, verify method bodies, and trace
+    reachability from exported components rather than matching method names, so
+    they emit far fewer false positives and tag each finding with a
+    ``confidence`` level. Manifest and data-storage use the v1 scanners (no v2
+    equivalent yet).
+
+    IMPORTANT — results are candidates, not a finished assessment. Findings from
+    the v2 scanners carry ``confidence`` and, when not high-confidence,
+    ``verification_needed=true`` plus a ``verify_with`` recipe. Before reporting
+    a finding to the user, confirm it by decompiling the cited code as the recipe
+    describes. See ``needs_verification_count`` in the response.
 
     Args:
         session_id: Session ID returned by load_apk.
@@ -1314,11 +1324,18 @@ def scan_all(session_id: str) -> dict:
         A dict with status and data containing all findings, per-scanner results,
         and a combined severity summary.
     """
+    # Local import avoids any import-order coupling between the v1 and v2 modules.
+    from apksaw.tools.security_v2 import (
+        scan_code_injection_v2,
+        scan_crypto_issues_v2,
+        scan_network_security_v2,
+    )
+
     scanners = {
         "manifest": scan_manifest_security,
-        "crypto": scan_crypto_issues,
-        "network": scan_network_security,
-        "code_injection": scan_code_injection,
+        "crypto": scan_crypto_issues_v2,
+        "network": scan_network_security_v2,
+        "code_injection": scan_code_injection_v2,
         "data_storage": scan_data_storage,
     }
 
@@ -1340,6 +1357,9 @@ def scan_all(session_id: str) -> dict:
             errors.append(f"{name}: {result.get('message', 'unknown error')}")
 
     combined_summary = _make_summary(all_findings)
+    needs_verification = sum(
+        1 for f in all_findings if f.get("verification_needed")
+    )
 
     return {
         "status": "ok" if not errors else "partial",
@@ -1347,6 +1367,12 @@ def scan_all(session_id: str) -> dict:
             "findings": all_findings,
             "summary": combined_summary,
             "total_findings": len(all_findings),
+            "needs_verification_count": needs_verification,
+            "guidance": (
+                "Findings with verification_needed=true are candidates. Follow "
+                "each finding's verify_with recipe (decompile the cited code and "
+                "confirm) before reporting it to the user as a real bug."
+            ),
             "per_scanner": {
                 k: {
                     "status": v.get("status"),
