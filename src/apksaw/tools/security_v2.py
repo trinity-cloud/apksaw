@@ -30,10 +30,10 @@ from typing import Any
 
 from apksaw.server import mcp
 from apksaw.session import get_session
+from apksaw.utils.webview_common import classify_webview_callsites
 from apksaw.utils.taint_lite import (
     check_empty_method_body,
     get_arg_source_type,
-    get_const_int_at_callsite,
     get_const_string_at_callsite,
     is_reachable_from_exported,
 )
@@ -785,27 +785,14 @@ def scan_network_security_v2(session_id: str) -> dict:
             ))
 
         # --------------------------------------------------------------- #
-        # WebView setMixedContentMode — resolve the int mode argument
+        # WebView setMixedContentMode — via the shared classifier (mode 0 =
+        # MIXED_CONTENT_ALWAYS_ALLOW is dangerous; 1/2 are safe and dropped).
         # --------------------------------------------------------------- #
-        mixed_always_allow: list[str] = []   # mode 0 = MIXED_CONTENT_ALWAYS_ALLOW
-        mixed_unknown: list[str] = []
-        for target_ma in analysis.find_methods(
-            classname=r"Landroid/webkit/WebSettings;",
-            methodname=r"setMixedContentMode",
-        ):
-            for _, caller_ma, call_offset in target_ma.get_xref_from():
-                loc = f"{caller_ma.class_name}->{caller_ma.name}"
-                mode = get_const_int_at_callsite(
-                    analysis, caller_ma, call_offset, arg_index=1
-                )
-                if mode == 0:
-                    if loc not in mixed_always_allow:
-                        mixed_always_allow.append(loc)
-                elif mode in (1, 2):
-                    continue  # NEVER_ALLOW / COMPATIBILITY_MODE — safe, not reported
-                else:
-                    if loc not in mixed_unknown:
-                        mixed_unknown.append(loc)
+        _mixed_sites = classify_webview_callsites(
+            analysis, "setMixedContentMode", arg_index=1, dangerous_value=0,
+        )
+        mixed_always_allow = [c["location"] for c in _mixed_sites if c["verdict"] == "dangerous"]
+        mixed_unknown = [c["location"] for c in _mixed_sites if c["verdict"] == "unresolved"]
 
         if mixed_always_allow:
             findings.append(_finding_v2(
@@ -887,30 +874,14 @@ def scan_network_security_v2(session_id: str) -> dict:
             ))
 
         # --------------------------------------------------------------- #
-        # WebView setAllowUniversalAccessFromFileURLs — resolve boolean arg
+        # WebView setAllowUniversalAccessFromFileURLs — via the shared
+        # classifier (the canonical FP: only true is dangerous; false dropped).
         # --------------------------------------------------------------- #
-        # This is the canonical pattern-scanner false positive: flagging the
-        # call as critical without reading the boolean. Call-sites that pass
-        # false (the safe default) are dropped entirely; only true is reported.
-        uafu_true: list[str] = []
-        uafu_unknown: list[str] = []
-        for target_ma in analysis.find_methods(
-            classname=r"Landroid/webkit/WebSettings;",
-            methodname=r"setAllowUniversalAccessFromFileURLs",
-        ):
-            for _, caller_ma, call_offset in target_ma.get_xref_from():
-                loc = f"{caller_ma.class_name}->{caller_ma.name}"
-                val = get_const_int_at_callsite(
-                    analysis, caller_ma, call_offset, arg_index=1
-                )
-                if val == 1:
-                    if loc not in uafu_true:
-                        uafu_true.append(loc)
-                elif val == 0:
-                    continue  # explicit false — the safe default, not reported
-                else:
-                    if loc not in uafu_unknown:
-                        uafu_unknown.append(loc)
+        _uafu_sites = classify_webview_callsites(
+            analysis, "setAllowUniversalAccessFromFileURLs", arg_index=1, dangerous_value=1,
+        )
+        uafu_true = [c["location"] for c in _uafu_sites if c["verdict"] == "dangerous"]
+        uafu_unknown = [c["location"] for c in _uafu_sites if c["verdict"] == "unresolved"]
 
         if uafu_true:
             findings.append(_finding_v2(
