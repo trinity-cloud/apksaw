@@ -474,6 +474,13 @@ def extract_secrets(session_id: str) -> dict:
         findings: list[dict] = []
         seen: set[str] = set()  # deduplicate by (pattern_name, value)
 
+        # Map pattern_name → probe tool name for live verification
+        _PROBE_HINT_MAP: dict[str, str] = {
+            "google_api_key": "probe_google_api_key",
+            "firebase_url": "probe_firebase_rtdb",
+            "aws_access_key": "probe_aws_key",
+        }
+
         for sa in analysis.get_strings():
             value = sa.get_value()
             methods = _xref_methods(sa)
@@ -498,6 +505,7 @@ def extract_secrets(session_id: str) -> dict:
                                     "value. For API keys, check whether the key is scoped/"
                                     "restricted before treating it as exploitable."
                                 ),
+                                "probe_hint": _PROBE_HINT_MAP.get(pattern_name, ""),
                                 "methods": methods,
                             }
                         )
