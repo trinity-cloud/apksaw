@@ -46,6 +46,9 @@ Each source file under `src/apksaw/tools/` registers a group of related tools:
 | `device.py` | `device_info`, `list_packages`, `app_info`, `pull_apk`, `screenshot` |
 | `dynamic.py` | `monitor_logcat`, `start_activity`, `send_broadcast`, `get_runtime_info`, `force_stop`, `clear_app_data`, `install_apk`, `uninstall_app`, `take_screenshot`, `prepare_frida_apk` |
 | `runtime.py` | `repackage_with_gadget`, `run_frida_script`, `capture_runtime_secrets` |
+| `secrets_probe.py` | `probe_secret`, `probe_google_api_key`, `probe_firebase_rtdb`, `probe_firebase_storage`, `probe_aws_key` |
+| `webview.py` | `scan_webview_surface` |
+| `app_links.py` | `verify_app_links` |
 | `apk.py` | `load_apk`, `get_manifest`, `get_permissions`, `get_components`, `list_files` |
 | `dex.py` | `list_classes`, `get_class_info`, `list_methods`, `decompile_method`, `decompile_class`, `decompile_apk_full` |
 | `strings.py` | `search_strings`, `extract_urls`, `extract_secrets`, `search_code`, `extract_interesting_strings` |

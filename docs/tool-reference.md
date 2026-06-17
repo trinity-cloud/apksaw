@@ -1,6 +1,6 @@
 # Tool Reference
 
-apksaw exposes **100 MCP tools**. You rarely call them by name — your coding agent picks the right ones from your natural-language request. This page is the full inventory for when you want to know exactly what's available, or wire a tool into a script.
+apksaw exposes **113 MCP tools**. You rarely call them by name — your coding agent picks the right ones from your natural-language request. This page is the full inventory for when you want to know exactly what's available, or wire a tool into a script.
 
 Tools fall into two categories:
 
@@ -48,6 +48,33 @@ These tools produce results, not just data. One tool call, structured output.
 | `find_rop_gadgets` | Capstone sweep of a native lib's `.text` for ROP gadget candidates, classified by mnemonic shape. Candidate generator (reliable on arm64/x86; best-effort on arm32), not a full ROPgadget/ropper replacement. |
 | `generate_jni_hook` | Demangles `Java_*` JNI exports from a `.so` and writes a Frida JS script that hooks each one, logging args/returns via `send()`. |
 | `execute_native_hook` | Runs a generated Frida hook script against the target app and captures `send()` payloads. Dry-run by default; live execution behind `confirm=True` + ADB device + Frida. |
+
+## Secret verification
+| Tool | What it does |
+|---|---|
+| `probe_secret` | Dispatcher that routes a discovered secret to the appropriate per-type probe. |
+| `probe_google_api_key` | Classifies a Google API key as valid/invalid/restricted via a passive Geocoding API call. |
+| `probe_firebase_rtdb` | Classifies a Firebase RTDB as world-readable/auth-required/not-found via passive shallow query. |
+| `probe_firebase_storage` | Classifies a Firebase Storage bucket; active mode (confirm-gated) lists up to N objects. |
+| `probe_aws_key` | Verifies an AWS key via sts:GetCallerIdentity; optional botocore; active enumerates policies. |
+
+## WebView / App Links
+| Tool | What it does |
+|---|---|
+| `scan_webview_surface` | Scans WebSettings setters (setAllowFileAccess, setJavaScriptEnabled, etc.) — resolves boolean args, drops proven-safe sites. |
+| `verify_app_links` | Verifies Android App Links posture: fetches `/.well-known/assetlinks.json` per autoVerify host, classifies ok/mismatch/missing/unreachable. |
+
+## PoC generators (Tier 2)
+| Tool | What it does |
+|---|---|
+| `generate_pending_intent_poc` | Detects mutable PendingIntent + implicit Intent sites (FLAG_MUTABLE via const/high16 resolution) and generates hijack PoC. |
+| `generate_task_hijack_poc` | Scans manifest for singleTask/singleInstance/non-default taskAffinity and emits StrandHogg-class attacker snippet. |
+| `generate_uri_grant_poc` | Detects content:// URI pass-through / grant-flag sites and emits coercion intent PoC. |
+
+## Native (Tier 2)
+| Tool | What it does |
+|---|---|
+| `map_jni_registrations` | Recovers dynamically-registered JNI methods (RegisterNatives in JNI_OnLoad) via Capstone + .rodata scan. Feeds generate_jni_hook. |
 
 ## Infrastructure — tools that give the agent hands
 

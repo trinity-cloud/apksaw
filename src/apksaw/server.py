@@ -39,6 +39,9 @@ from .tools import fuzzer_v2  # noqa: F401, E402
 from .tools import anti_analysis  # noqa: F401, E402
 from .tools import runtime  # noqa: F401, E402
 from .tools import exploit_gen  # noqa: F401, E402
+from .tools import secrets_probe  # noqa: F401, E402
+from .tools import webview  # noqa: F401, E402
+from .tools import app_links  # noqa: F401, E402
 
 # Load plugins (must be after all built-in tool imports)
 from .plugins import discover_and_load_plugins, _plugin_results  # noqa: F401, E402

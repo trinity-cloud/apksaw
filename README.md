@@ -5,7 +5,7 @@
 <p align="center">
   <h1 align="center">apksaw</h1>
   <p align="center"><strong>Audit your Android app's security — in plain English.</strong></p>
-  <p align="center">100 MCP tools. Point any MCP coding agent at your APK and ask it to find the bugs.</p>
+  <p align="center">113 MCP tools. Point any MCP coding agent at your APK and ask it to find the bugs.</p>
 </p>
 
 <p align="center">
@@ -53,7 +53,7 @@ claude mcp add apksaw -- uv run --directory /path/to/apksaw apksaw
 
 **Any other MCP client** (Cursor, Cline, Windsurf, Claude Desktop): point it at the stdio command `uv run --directory /path/to/apksaw apksaw`. See [Installation](docs/installation.md) for per-client config snippets.
 
-Restart your agent — all 100 tools appear automatically. Then just talk to it:
+Restart your agent — all 113 tools appear automatically. Then just talk to it:
 
 ```
 > Pull my app from the connected device, run a full security scan,
@@ -122,12 +122,12 @@ apksaw MCP Server
   └─ Frida ───────> Runtime hooks and evidence capture
 ```
 
-The 100 tools split into two kinds:
+The 113 tools split into two kinds:
 
 - **Infrastructure tools give the agent hands.** Decompiled Java, cross-references, parsed manifests — the structured data the agent reads and reasons about. (An LLM can't read DEX bytecode; this is how it sees.)
 - **Automation tools do the work.** The fuzzer fires malformed intents and watches logcat; the scanners run taint analysis; the diff engine reverse-engineers what a patch fixed. One call, a conclusion — not raw data to interpret.
 
-📖 **Full inventory:** [Tool Reference](docs/tool-reference.md) (all 100 tools) · **Internals:** [Architecture](docs/architecture.md)
+📖 **Full inventory:** [Tool Reference](docs/tool-reference.md) (all 113 tools) · **Internals:** [Architecture](docs/architecture.md)
 
 ## For Security Engineers
 
@@ -142,7 +142,7 @@ What's in the box beyond the basics:
 - **Native + API surface** — `.so` analysis (LIEF + Capstone), protobuf/gRPC schema reconstruction, endpoint and auth-interceptor mapping
 - **Native exploit pipeline (self-audit only)** — ROP gadget discovery over `.text` (`find_rop_gadgets`), JNI hook generation from `Java_*` exports (`generate_jni_hook`), and on-device Frida execution (`execute_native_hook`) with a confirm-gated dry-run posture. The compose chain `analyze_native_lib → generate_jni_hook → execute_native_hook` closes the static→dynamic verify loop for apps that push auth, crypto, and license validation into native `.so` code.
 
-See the [Tool Reference](docs/tool-reference.md) for all 100 tools and [Architecture](docs/architecture.md) for the module layout.
+See the [Tool Reference](docs/tool-reference.md) for all 113 tools and [Architecture](docs/architecture.md) for the module layout.
 
 ## Case Studies
 
