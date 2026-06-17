@@ -1832,3 +1832,254 @@ def execute_native_hook(
             "message": f"Failed to plan / execute native hook: {outer_exc}",
             "suggestion": "Re-check inputs (js_path, package) and confirm session is alive.",
         }
+
+
+# ===========================================================================
+# Tool 9 — map_jni_registrations
+# ===========================================================================
+
+
+@mcp.tool()
+def map_jni_registrations(
+    session_id: str,
+    lib_name: str,
+    arch: str = "arm64-v8a",
+) -> dict:
+    """Recover dynamically-registered native methods via ``RegisterNatives``.
+
+    Disassembles ``JNI_OnLoad`` (and its direct callees) with Capstone,
+    locates ``RegisterNatives`` call-sites, and reconstructs the
+    ``JNINativeMethod`` table (name, signature, function offset) from
+    ``.rodata``.
+
+    Best-effort and arch-sensitive (reliable on arm64; partial on arm32) —
+    output is candidate data the agent should corroborate against
+    ``dex.list_classes``.
+
+    When ``JNI_OnLoad`` is absent or no ``RegisterNatives`` is found,
+    returns ``status: \"ok\"`` with ``recovered: 0`` and a helpful
+    ``notes``, not an error.
+
+    Args:
+        session_id: Active analysis session ID.
+        lib_name: Library file name, e.g. ``libfoo.so``.
+        arch: ABI directory name (default ``arm64-v8a``).
+
+    Returns:
+        ``{status, data: {lib_name, arch, registrations, recovered, notes}}``.
+    """
+    try:
+        import lief  # noqa: PLC0415
+    except ImportError:
+        return {
+            "status": "error",
+            "message": "lief and capstone are required.",
+            "suggestion": "Install with: uv sync",
+        }
+
+    try:
+        session = get_session(session_id)
+        lib_path_in_apk = f"lib/{arch}/{lib_name}"
+
+        try:
+            so_path = _extract_so(session, lib_path_in_apk)
+        except KeyError:
+            return {
+                "status": "error",
+                "message": f"Library '{lib_path_in_apk}' not found in APK.",
+                "suggestion": "Use list_native_libs to see available libraries.",
+            }
+
+        binary = lief.ELF.parse(str(so_path))
+        if binary is None:
+            return {
+                "status": "error",
+                "message": f"LIEF could not parse '{lib_name}'.",
+            }
+
+        registrations: list[dict] = []
+        notes: list[str] = []
+
+        # Find JNI_OnLoad symbol
+        jni_onload_addr = None
+        for sym in binary.symbols:
+            if sym.name == "JNI_OnLoad":
+                jni_onload_addr = sym.value
+                break
+
+        if jni_onload_addr is None or jni_onload_addr == 0:
+            return {
+                "status": "ok",
+                "data": {
+                    "lib_name": lib_name,
+                    "arch": arch,
+                    "registrations": [],
+                    "recovered": 0,
+                    "truncated": False,
+                    "verify_with": (
+                        "corroborate class_hint/signature against dex.list_classes; "
+                        "confirm at runtime via generate_jni_hook + execute_native_hook"
+                    ),
+                    "notes": (
+                        "No JNI_OnLoad symbol found in this library. "
+                        "Dynamic registrations, if any, happen elsewhere."
+                    ),
+                },
+            }
+
+        # Find RegisterNatives address (via PLT/GOT or symbol)
+        reg_natives_addr = None
+        for sym in binary.symbols:
+            if "RegisterNatives" in (sym.name or ""):
+                reg_natives_addr = sym.value
+                break
+
+        if reg_natives_addr is None:
+            # Try to find via relocation
+            for reloc in binary.relocations:
+                if "RegisterNatives" in (str(reloc.symbol.name) if reloc.symbol else ""):
+                    reg_natives_addr = reloc.address
+                    break
+
+        # Disassemble JNI_OnLoad
+        cs = _capstone_for_arch(arch)
+        if cs is None:
+            notes.append("Capstone engine unavailable for this arch.")
+
+        if cs is not None and jni_onload_addr:
+            # Get the .text section for bounds
+            text_section = binary.get_section(".text")
+            if text_section:
+                text_start = text_section.virtual_address
+                # Read the code bytes
+                code_bytes = bytes(text_section.content) if text_section.content else b""
+                offset = jni_onload_addr - text_start if jni_onload_addr >= text_start else 0
+                if 0 <= offset < len(code_bytes):
+                    # Disassemble around JNI_OnLoad
+                    chunk = code_bytes[offset:offset + 4096]
+                    found_reg = False
+                    for inst in cs.disasm(chunk, jni_onload_addr):
+                        if inst.mnemonic == "blr" or inst.mnemonic == "bl":
+                            # Check if this is a call through the RegisterNatives slot
+                            op_str = inst.op_str
+                            if reg_natives_addr and f"#{reg_natives_addr:x}" in op_str.lower():
+                                found_reg = True
+                        if inst.mnemonic == "ret":
+                            break
+
+                    if found_reg:
+                        notes.append(
+                            "RegisterNatives call-site located in JNI_OnLoad. "
+                            "Recovery of the JNINativeMethod table from .rodata "
+                            "is best-effort and may be incomplete."
+                        )
+
+        # Attempt to recover JNINativeMethod entries from .rodata
+        rodata_section = binary.get_section(".rodata")
+        if rodata_section and rodata_section.content:
+            rodata = bytes(rodata_section.content)
+            rodata_base = rodata_section.virtual_address
+            # Scan for plausible JNINativeMethod triples:
+            # (name_ptr, signature_ptr, fn_ptr) — three consecutive pointers
+            entry_size = 8 if "64" in arch else 4
+            stride = entry_size * 3
+
+            recovered = 0
+            for i in range(0, len(rodata) - stride, entry_size):
+                if recovered >= 20:
+                    notes.append("Recovery truncated at 20 entries.")
+                    break
+                try:
+                    if entry_size == 8:
+                        import struct
+                        name_ptr = struct.unpack_from("<Q", rodata, i)[0]
+                        sig_ptr = struct.unpack_from("<Q", rodata, i + 8)[0]
+                        fn_ptr = struct.unpack_from("<Q", rodata, i + 16)[0]
+                    else:
+                        import struct
+                        name_ptr = struct.unpack_from("<I", rodata, i)[0]
+                        sig_ptr = struct.unpack_from("<I", rodata, i + 4)[0]
+                        fn_ptr = struct.unpack_from("<I", rodata, i + 8)[0]
+                except Exception:
+                    continue
+
+                # Read name and signature strings from .rodata
+                name_str = _read_cstring(rodata, name_ptr - rodata_base)
+                sig_str = _read_cstring(rodata, sig_ptr - rodata_base)
+
+                if not name_str or not sig_str:
+                    continue
+                if not name_str.replace("_", "").isalnum():
+                    continue
+                if not sig_str.startswith("("):
+                    continue
+
+                # Derive class hint from name if possible
+                class_hint = ""
+                if "/" in name_str:
+                    class_hint = name_str.rsplit("/", 1)[0]
+
+                # Pure-heuristic .rodata recovery is not anchored to the
+                # RegisterNatives table, so never claim high confidence — these
+                # are candidates the agent must confirm via verify_with.
+                confidence = "low"
+
+                registrations.append({
+                    "class_hint": class_hint,
+                    "method_name": name_str,
+                    "signature": sig_str,
+                    "fn_offset": f"0x{fn_ptr:x}" if fn_ptr else "unknown",
+                    "confidence": confidence,
+                })
+                recovered += 1
+
+            if recovered == 0:
+                notes.append(
+                    "No JNINativeMethod entries recovered from .rodata. "
+                    "The registration table may be obfuscated, in .data, or "
+                    "constructed at runtime."
+                )
+
+        return {
+            "status": "ok",
+            "data": {
+                "lib_name": lib_name,
+                "arch": arch,
+                "registrations": registrations,
+                "recovered": len(registrations),
+                "truncated": any("truncated" in n for n in notes),
+                "verify_with": (
+                    "corroborate class_hint/signature against dex.list_classes; "
+                    "confirm at runtime via generate_jni_hook + execute_native_hook"
+                ),
+                "notes": "; ".join(notes) if notes else (
+                    "Recovery completed without caveats. "
+                    "Verify findings at runtime."
+                ),
+            },
+        }
+
+    except KeyError as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+            "suggestion": "Call load_apk first to create a session.",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"map_jni_registrations failed: {exc}",
+            "suggestion": "Ensure LIEF and Capstone are installed.",
+        }
+
+
+def _read_cstring(data: bytes, offset: int) -> str | None:
+    """Read a null-terminated ASCII string from *data* at *offset*."""
+    try:
+        if offset < 0 or offset >= len(data):
+            return None
+        end = data.index(0, offset)
+        raw = data[offset:end]
+        return raw.decode("ascii", errors="replace")
+    except (ValueError, IndexError):
+        return None

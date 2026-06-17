@@ -27,6 +27,7 @@ from apksaw.tools.native import (
     execute_native_hook,
     find_rop_gadgets,
     generate_jni_hook,
+    map_jni_registrations,
 )
 
 _NA = "apksaw.tools.native"
@@ -420,3 +421,51 @@ def test_generated_script_contains_args_to_json(mock_session):
     assert result["status"] == "ok"
     script = result["data"]["script"]
     assert "args_to_json" in script
+
+
+# ===========================================================================
+# map_jni_registrations — regression for the _capstone_for_arch arity bug
+# ===========================================================================
+
+
+def _make_jni_binary(jni_onload: bool = True):
+    """Mock LIEF binary exposing (or not) a JNI_OnLoad symbol."""
+    binary = MagicMock()
+    syms = []
+    if jni_onload:
+        s = MagicMock()
+        s.name = "JNI_OnLoad"
+        s.value = 0x2000
+        syms.append(s)
+    binary.symbols = syms
+    binary.relocations = []
+    binary.get_section.return_value = None  # skip .text/.rodata paths
+    return binary
+
+
+def test_map_jni_no_onload_returns_ok_empty(mock_session):
+    binary = _make_jni_binary(jni_onload=False)
+    with _with_extraction(mock_session), \
+         patch("lief.ELF.parse", return_value=binary):
+        result = map_jni_registrations(
+            mock_session.session_id, "libnative.so", arch="arm64-v8a",
+        )
+    assert result["status"] == "ok"
+    assert result["data"]["recovered"] == 0
+
+
+def test_map_jni_calls_capstone_with_single_arg(mock_session):
+    """Regression: _capstone_for_arch(arch) — one positional arg.
+
+    The arity bug `_capstone_for_arch(so_path, arch)` raised TypeError on any
+    lib WITH JNI_OnLoad, which was swallowed into status:error.
+    """
+    binary = _make_jni_binary(jni_onload=True)
+    with _with_extraction(mock_session), \
+         patch("lief.ELF.parse", return_value=binary), \
+         patch(f"{_NA}._capstone_for_arch", return_value=None) as cs_mock:
+        result = map_jni_registrations(
+            mock_session.session_id, "libnative.so", arch="arm64-v8a",
+        )
+    assert result["status"] == "ok"  # no TypeError → not error
+    cs_mock.assert_called_once_with("arm64-v8a")
