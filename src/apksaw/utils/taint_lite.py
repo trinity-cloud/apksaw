@@ -15,12 +15,42 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     pass  # Androguard types are imported lazily at call-time
 
 logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------- #
+# Resolution policy
+# ----------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class TaintPolicy:
+    """Resolution-policy knobs for constant-resolution traces.
+
+    Instances are immutable so callers can safely reuse the module-level
+    defaults without accidental mutation.  The integer resolver currently
+    remains conservative and intra-procedural; inter-procedural int/field
+    following is represented here as an explicit future extension point.
+    """
+
+    max_depth: int = 2
+    """Reserved maximum inter-procedural hop count."""
+
+    follow_calls: bool = False
+    """Reserved flag for following method returns across boundaries."""
+
+    follow_fields: bool = True
+    """Reserved flag for following one-write static fields."""
+
+
+DEFAULT_POLICY = TaintPolicy()  # current behaviour — unchanged
+DEEP_POLICY = TaintPolicy(max_depth=3, follow_calls=True)
 
 # ----------------------------------------------------------------------- #
 # Entry-point method names per component type
@@ -181,22 +211,32 @@ def get_const_int_at_callsite(
     method_analysis,
     invoke_offset: int,
     arg_index: int,
+    policy: TaintPolicy = DEFAULT_POLICY,
 ) -> int | None:
     """Walk backwards from an invoke instruction to find the integer/boolean
     constant that feeds the argument at *arg_index*.
 
     This is the primitive-valued counterpart to
     :func:`get_const_string_at_callsite`.  It resolves ``const/4``,
-    ``const/16``, ``const``, and the wide variants, following one level of
-    ``move`` indirection.  Booleans are represented as ``0`` (false) / ``1``
-    (true) in Dalvik, so this also resolves boolean arguments such as the one
-    passed to ``WebSettings.setAllowUniversalAccessFromFileURLs(boolean)``.
+    ``const/16``, ``const``, ``const/high16``, and the wide variants,
+    following one level of ``move`` indirection.  Booleans are represented as
+    ``0`` (false) / ``1`` (true) in Dalvik, so this also resolves boolean
+    arguments such as the one passed to
+    ``WebSettings.setAllowUniversalAccessFromFileURLs(boolean)``.
+
+    ``const/high16`` is resolved as-is: Androguard's ``Instruction21h`` already
+    left-shifts the operand for OP 0x15 and renders the full 32-bit value, so no
+    extra shift is applied. This covers compile-time constant-folded flags like
+    ``FLAG_MUTABLE = 0x02000000`` that have zero low-16 bits. ``or-int`` flag
+    composition is also resolved; ``sget`` static-field loads are not followed.
 
     Conservative by design: anything it cannot prove to be a literal returns
     ``None`` (caller should treat that as "unresolved", not "safe").
-    ``const/high16`` is deliberately *not* resolved because Androguard renders
-    its operand pre-shift, which would yield a wrong value — booleans and small
-    mode flags never use ``high16`` so nothing of interest is lost.
+
+    The *policy* parameter is accepted so callers can opt into named resolution
+    profiles without changing call signatures, but this integer path currently
+    does not follow method returns or static fields.  ``move-result`` and
+    ``sget`` remain unresolved.
 
     Args:
         analysis: Androguard ``Analysis`` object.
@@ -204,6 +244,8 @@ def get_const_int_at_callsite(
         invoke_offset: Byte offset of the invoke instruction.
         arg_index: Zero-based argument index. For instance methods index 0 is
             ``this``; for a one-arg setter the value is at index 1.
+        policy: Resolution policy controlling depth and inter-procedural
+            following.  Defaults to :data:`DEFAULT_POLICY`.
 
     Returns:
         The integer value if it can be resolved, otherwise ``None``.
@@ -1577,8 +1619,16 @@ def _trace_int_register_backward(instructions, start_idx: int, target_reg: str) 
     """Walk backwards from *start_idx* to find an integer ``const*`` that last
     wrote to *target_reg*.  Follows one level of ``move`` indirection.
 
-    Returns the integer value or ``None``.  ``const/high16`` is intentionally
-    not handled (see :func:`get_const_int_at_callsite`).
+    ``const/high16`` is taken **as-is**: Androguard's ``Instruction21h`` already
+    left-shifts the operand for OP 0x15 and ``get_output()`` renders the full
+    32-bit value (e.g. ``FLAG_MUTABLE`` 0x02000000 → ``"v0, 33554432"``), so
+    applying another shift would corrupt every high16 constant.
+
+    ``or-int`` / ``or-int/2addr`` / ``or-int/lit*`` are resolved by recursively
+    tracing the operand registers — covering runtime-composed flag sets like
+    ``FLAG_MUTABLE | FLAG_UPDATE_CURRENT`` that the compiler did not fold.
+    ``sget`` static-field loads are intentionally not followed (resolving them
+    would require field-initialiser analysis); they terminate the trace at None.
     """
     current_reg = target_reg
     for idx in range(start_idx, -1, -1):
@@ -1591,8 +1641,29 @@ def _trace_int_register_backward(instructions, start_idx: int, target_reg: str) 
             continue
 
         if mnemonic in ("const/4", "const/16", "const",
+                        "const/high16",
                         "const-wide", "const-wide/16", "const-wide/32"):
+            # const/high16 included: Androguard already renders the shifted value.
             return _extract_const_int_value(output)
+
+        if mnemonic in ("or-int", "or-int/2addr"):
+            regs, _lit = _split_reg_operands(output)
+            if mnemonic == "or-int" and len(regs) >= 3:
+                src_a, src_b = regs[1], regs[2]
+            elif mnemonic == "or-int/2addr" and len(regs) >= 2:
+                src_a, src_b = regs[0], regs[1]
+            else:
+                return None
+            a = _trace_int_register_backward(instructions, idx - 1, src_a)
+            b = _trace_int_register_backward(instructions, idx - 1, src_b)
+            return (a | b) if (a is not None and b is not None) else None
+
+        if mnemonic in ("or-int/lit8", "or-int/lit16"):
+            regs, lit = _split_reg_operands(output)
+            if len(regs) >= 2 and lit is not None:
+                base = _trace_int_register_backward(instructions, idx - 1, regs[1])
+                return (base | lit) if base is not None else None
+            return None
 
         if mnemonic in ("move", "move/from16", "move/16",
                         "move-wide", "move-wide/from16", "move-wide/16"):
@@ -1605,7 +1676,7 @@ def _trace_int_register_backward(instructions, start_idx: int, target_reg: str) 
             # Value came from a call — not a static constant.
             return None
 
-        # Any other instruction writing to current_reg terminates the trace.
+        # Any other instruction writing to current_reg (incl. sget) terminates.
         return None
 
     return None
@@ -1628,3 +1699,32 @@ def _extract_const_int_value(output: str) -> int | None:
         return int(val, 10)
     except (ValueError, IndexError):
         return None
+
+
+def _split_reg_operands(output: str) -> tuple[list[str], int | None]:
+    """Split a binop instruction output into register tokens and a literal.
+
+    Examples::
+
+        "v0, v1, v2"    -> (["v0", "v1", "v2"], None)
+        "v0, v1, 0x2"   -> (["v0", "v1"], 2)
+        "v0, v1"        -> (["v0", "v1"], None)
+
+    Returns ``(register_tokens, literal_or_None)``.
+    """
+    regs: list[str] = []
+    lit: int | None = None
+    for tok in output.split(","):
+        t = tok.strip()
+        if len(t) >= 2 and t[0] in ("v", "p") and t[1:].isdigit():
+            regs.append(t)
+            continue
+        head = t.split()[0].strip() if t else ""
+        if not head:
+            continue
+        try:
+            lowered = head.lower()
+            lit = int(head, 16) if lowered.startswith(("0x", "-0x")) else int(head, 10)
+        except ValueError:
+            pass
+    return regs, lit
